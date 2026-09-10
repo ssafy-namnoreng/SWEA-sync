@@ -1,0 +1,3 @@
+playwright>=1.44
+rich>=13
+questionary>=2

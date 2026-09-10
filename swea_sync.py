@@ -1,0 +1,1095 @@
+# -*- coding: utf-8 -*-
+"""
+SWEA Solving Club -> 팀 레포 자동 동기화
+
+하는 일
+  1) 그날의 problem box(문제 목록) 페이지에서 문제들을 읽어온다
+  2) 각 문제마다  daily/<날짜>/<팀>/SWEA-<번호>/  폴더를 만들고
+     - readme.md       : "# 제목 난이도" + "## [바로가기](링크)"
+     - <원본파일명>.txt : SWEA에서 받은 sample input 을 파일명 그대로 저장
+     을 생성한다
+
+사용법
+  python swea_sync.py                  # 열려 있는 브라우저의 SWEA 탭을 인식해서 진행
+  python swea_sync.py "<문제목록 URL>"  # URL 직접 지정
+  python swea_sync.py --inspect        # 페이지 구조 덤프 (셀렉터가 안 맞을 때)
+자세한 내용은 README.md 참고.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.request
+from datetime import date
+from pathlib import Path
+from urllib.parse import quote
+
+import bootstrap
+
+# playwright 는 '아직 안 깔렸을 수도 있는' 패키지라 여기서 바로 import 하지 않는다.
+# bootstrap.ensure_packages() 로 설치를 마친 뒤 load_playwright() 가 채워 넣는다.
+sync_playwright = None
+
+
+class PWTimeout(Exception):
+    """playwright 를 아직 못 불러왔을 때 쓰는 자리표시자."""
+
+
+def load_playwright():
+    global sync_playwright, PWTimeout
+    from playwright.sync_api import sync_playwright as _sp, TimeoutError as _pt
+    sync_playwright, PWTimeout = _sp, _pt
+
+# 윈도우 콘솔(cp949)에서 한글 로그가 깨지지 않도록
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+HERE = Path(__file__).resolve().parent
+SWEA_HOST = "swexpertacademy.com"
+LIST_URL_HINTS = ("problemBoxDetail", "problemBox", "probBoxId", "solvingClub")
+
+# 창을 띄웠을 때 처음 보여줄 페이지 (앞에서부터 시도).
+# SWEA 메인 루트가 먼저다. 로그인 버튼이 여기 있고, 로그인 후 클럽으로 이동하면 된다.
+# (login.do 는 본문이 빈 페이지, clubList.do 는 HTTP 405 라 둘 다 못 쓴다)
+LANDING_URLS = (
+    f"https://{SWEA_HOST}/main/main.do",
+    f"https://{SWEA_HOST}/main/talk/solvingClub/clubMain.do",
+)
+
+
+# ---------------------------------------------------------------- config
+
+SETTINGS_FILE = "settings.txt"
+
+# settings.txt 에서 쓸 수 있는 키 이름들. 한글/영문 아무거나 써도 되게 한다.
+KEY_ALIASES = {
+    "repo_path":   ("경로", "레포경로", "레포", "저장소", "repo", "repo_path", "path"),
+    "team":        ("팀", "팀이름", "조", "team"),
+    "date":        ("날짜", "date", "day"),
+    "list_url":    ("문제목록", "문제목록주소", "목록", "url", "list_url"),
+    "headless":    ("창숨김", "숨김", "백그라운드", "headless"),
+    "folder_title": ("폴더에제목", "폴더제목", "제목폴더", "foldertitle", "folder_title"),
+    "folder_box":  ("폴더에박스", "폴더박스", "박스이름", "folderbox", "folder_box"),
+    "readme":      ("readme", "readme생성", "리드미", "설명파일"),
+    "rename_folders": ("폴더이름갱신", "이름갱신", "폴더갱신", "renamefolders", "rename_folders"),
+    "profile_dir": ("브라우저프로필", "프로필", "profile", "profile_dir"),
+    "cdp_port":    ("포트", "port", "cdp_port"),
+}
+TODAY_WORDS = ("", "오늘", "today", "auto", "자동")
+TRUE_WORDS = ("예", "네", "응", "y", "yes", "true", "1", "on", "켬")
+FALSE_WORDS = ("아니오", "아니요", "아뇨", "n", "no", "false", "0", "off", "끔")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_bool(value, field):
+    v = str(value).strip().lower()
+    if v in TRUE_WORDS:
+        return True
+    if v in ("",) or v in FALSE_WORDS:
+        return False
+    sys.exit(f"'{field}' 는 예 / 아니오 로 적어주세요. 지금 값: {value!r}")
+
+
+def _canon_key(raw):
+    """'브라우저 프로필', 'repo path' 처럼 띄어쓰기가 섞여도 알아듣게 한다."""
+    k = re.sub(r"[\s_-]+", "", (raw or "")).lower()
+    for canon, aliases in KEY_ALIASES.items():
+        for a in aliases:
+            if k == re.sub(r"[\s_-]+", "", a).lower():
+                return canon
+    return None
+
+
+def _read_text_any(path):
+    """인코딩이 뭐든 최대한 읽어낸다.
+
+    조원이 메모장으로 열어 'ANSI'(cp949)로 저장해버리는 일이 흔해서,
+    UTF-8(BOM 포함/미포함) -> cp949 순으로 시도한다.
+    """
+    data = path.read_bytes()
+    for enc in ("utf-8-sig", "cp949", "utf-8"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def read_settings_file(path):
+    """settings.txt 를 읽어 dict 로 돌려준다. '키 = 값', '#' 은 주석."""
+    values, unknown = {}, []
+    if not path.exists():
+        return values, unknown
+
+    for lineno, raw in enumerate(_read_text_any(path).splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            unknown.append(f"{lineno}행: '=' 가 없어 무시함 -> {line}")
+            continue
+        key, _, val = line.partition("=")
+        canon = _canon_key(key)
+        if not canon:
+            unknown.append(f"{lineno}행: 모르는 항목 '{key.strip()}'")
+            continue
+        values[canon] = val.strip().strip('"').strip("'")
+    return values, unknown
+
+
+def set_setting_value(path, canon_key, value):
+    """settings.txt 의 값 하나만 바꾼다.
+
+    주석과 빈 줄, 인코딩(BOM), 줄바꿈 방식을 그대로 유지한다.
+    설명이 잔뜩 달린 파일이라 통째로 다시 쓰면 안 된다.
+    """
+    raw = path.read_bytes()
+    has_bom = raw.startswith(b"\xef\xbb\xbf")
+    text = _read_text_any(path)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+
+    replaced = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key, _, _old = line.partition("=")
+        if _canon_key(key) == canon_key:
+            lines[i] = f"{key}= {value}".rstrip()
+            replaced = True
+            break
+
+    if not replaced:                     # 없던 항목이면 끝에 추가
+        names = KEY_ALIASES.get(canon_key) or (canon_key,)
+        lines += ["", f"{names[0]} = {value}"]
+
+    out = newline.join(lines) + newline
+    path.write_bytes(out.encode("utf-8-sig" if has_bom else "utf-8"))
+    return replaced
+
+
+def check_repo_path(text):
+    """사람이 입력한 레포 경로를 다듬고 살펴본다.
+
+    반환: (쓸 수 있나, 정리된 경로, 알려줄 말)
+    붙여넣기 하면 따옴표가 딸려오는 일이 흔해서 먼저 떼어낸다.
+    """
+    raw = (text or "").strip().strip('"').strip("'").strip()
+    if not raw:
+        return False, "", "경로가 비어 있습니다."
+
+    try:
+        p = Path(raw).expanduser()
+    except Exception:
+        return False, raw, "경로 형태가 아닙니다."
+
+    if not p.exists():
+        return False, str(p), f"그런 폴더가 없습니다: {p}"
+    if not p.is_dir():
+        return False, str(p), f"폴더가 아니라 파일입니다: {p}"
+
+    p = p.resolve()
+    # algorithm 레포라면 daily 폴더가 있어야 한다. 없으면 상위/하위를 한 번 봐준다.
+    if (p / "daily").is_dir():
+        return True, str(p), f"확인했습니다. daily 폴더가 있습니다."
+    if p.name == "daily" and p.parent.is_dir():
+        return True, str(p.parent), f"daily 안쪽을 고르신 것 같아 상위로 잡았습니다: {p.parent}"
+    for child in sorted(x for x in p.iterdir() if x.is_dir()):
+        if (child / "daily").is_dir():
+            return True, str(child), f"바로 아래 {child.name} 이 algorithm 레포로 보입니다."
+    return True, str(p), "폴더는 있지만 daily 폴더가 안 보입니다. 이 경로가 맞는지 확인해주세요."
+
+
+def load_config(args, strict=True) -> dict:
+    """기본값 < settings.txt < 명령줄 옵션 순으로 덮어쓴다."""
+    cfg = {
+        "repo_path": "",
+        "team": "",
+        "date": "",
+        "list_url": "",
+        "headless": "",
+        "folder_title": "",     # 폴더명에 문제 제목까지 넣을지 (기본: 번호만)
+        "folder_box": "",       # 폴더명에 문제 박스 이름까지 넣을지
+        "readme": "예",          # readme.md 를 만들지 (기본: 만든다)
+        "rename_folders": "",   # 이미 있는 폴더 이름을 지금 설정에 맞게 바꿀지
+        "profile_dir": "",
+        "cdp_port": 9222,
+    }
+
+    settings_path = HERE / SETTINGS_FILE
+    file_values, unknown = read_settings_file(settings_path)
+    for w in unknown:
+        print(f"[!] {SETTINGS_FILE} {w}")
+    cfg.update({k: v for k, v in file_values.items() if v != ""})
+
+    # 명령줄 옵션이 있으면 그게 이긴다
+    if args.repo:
+        cfg["repo_path"] = args.repo
+    if args.team:
+        cfg["team"] = args.team
+    if args.date:
+        cfg["date"] = args.date
+    if args.url:
+        cfg["list_url"] = args.url
+
+    cfg["headless"] = parse_bool(cfg["headless"], "창숨김")
+    if args.headless:
+        cfg["headless"] = True
+    if args.show:
+        cfg["headless"] = False
+
+    cfg["folder_title"] = parse_bool(cfg["folder_title"], "폴더에제목")
+    if args.folder_title:
+        cfg["folder_title"] = True
+    if args.no_folder_title:
+        cfg["folder_title"] = False
+
+    cfg["folder_box"] = parse_bool(cfg["folder_box"], "폴더에박스")
+    if args.folder_box:
+        cfg["folder_box"] = True
+    if args.no_folder_box:
+        cfg["folder_box"] = False
+
+    cfg["readme"] = parse_bool(cfg["readme"], "readme")
+    if args.no_readme:
+        cfg["readme"] = False
+
+    cfg["rename_folders"] = parse_bool(cfg["rename_folders"], "폴더이름갱신")
+    if args.rename_folders:
+        cfg["rename_folders"] = True
+    if args.no_rename_folders:
+        cfg["rename_folders"] = False
+
+    # 날짜: 비어 있거나 '오늘' 이면 오늘 날짜
+    if str(cfg["date"]).strip().lower() in TODAY_WORDS:
+        cfg["date"] = date.today().isoformat()
+    elif not DATE_RE.match(str(cfg["date"]).strip()):
+        sys.exit(f"날짜 형식이 잘못됐습니다: {cfg['date']!r}\n"
+                 f"  YYYY-MM-DD 로 적어주세요. 예) 2026-09-01\n"
+                 f"  오늘 날짜를 쓰려면 {SETTINGS_FILE} 의 '날짜' 를 비워두면 됩니다.")
+    cfg["date"] = str(cfg["date"]).strip()
+
+    if not cfg["profile_dir"]:
+        cfg["profile_dir"] = str(Path.home() / ".swea_sync" / "chrome-profile")
+
+    try:
+        cfg["cdp_port"] = int(str(cfg["cdp_port"]).strip())
+    except ValueError:
+        sys.exit(f"포트는 숫자여야 합니다: {cfg['cdp_port']!r}")
+
+    if not settings_path.exists():
+        sys.exit(f"{settings_path} 가 없습니다.\n"
+                 f"  배포받은 {SETTINGS_FILE} 을 이 폴더에 두고 '경로' 와 '팀' 을 채워주세요.")
+    # strict=False 면 비어 있어도 그냥 돌려준다. 부르는 쪽에서 설정 마법사를 띄운다.
+    if strict and not cfg["repo_path"]:
+        sys.exit(f"{SETTINGS_FILE} 의 '경로' 가 비어 있습니다.\n"
+                 f"  git clone 받은 algorithm 폴더 경로를 적어주세요.\n"
+                 f"  예)  경로 = C:/Users/내계정/PycharmProjects/algorithm")
+    if strict and not cfg["team"]:
+        sys.exit(f"{SETTINGS_FILE} 의 '팀' 이 비어 있습니다.\n"
+                 f"  자기 조 폴더명을 적어주세요.  예)  팀 = team-E")
+    # 창숨김은 열린 탭을 볼 수 없으니 문제 목록 주소가 있어야 한다.
+    # 없으면 막는 대신 창을 띄운다 (그래야 탭을 보고 진행할 수 있다).
+    if cfg["headless"] and not cfg["list_url"]:
+        print(f"[i] '문제목록' 주소가 없어서 이번엔 창을 띄웁니다."
+              f"  (창숨김으로 쓰려면 {SETTINGS_FILE} 의 '문제목록' 을 채워주세요)")
+        cfg["headless"] = False
+    return cfg
+
+
+# ---------------------------------------------------------------- browser
+
+def _debug_port_alive(endpoint, timeout=2.0) -> bool:
+    """CDP HTTP 엔드포인트가 응답하는지만 가볍게 확인한다.
+
+    connect_over_cdp 를 바로 여러 번 때리면 websocket 연결이 쌓여서 오히려
+    핸드셰이크가 타임아웃난다. 그래서 먼저 HTTP 로 살아있는지만 본다.
+    """
+    try:
+        with urllib.request.urlopen(f"{endpoint}/json/version", timeout=timeout) as r:
+            json.loads(r.read().decode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+
+def kill_process_tree(proc):
+    """창숨김으로 띄운 브라우저를 확실히 정리한다.
+
+    CDP 로 붙은 경우 browser.close() 만으로는 자식 프로세스가 남는다.
+    보이지 않는 창이라 사용자가 눈치챌 수 없으므로 프로세스 트리째 종료한다.
+    """
+    if proc is None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=15)
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+def attach_browser(pw, cfg):
+    """이미 열려 있는 브라우저에 붙고, 없으면 새로 띄운다. 반환: (context, launched_now, proc)
+
+    브라우저는 이 스크립트와 별개 프로세스로 띄운다. 그래야 스크립트가 끝나도
+    창이 살아 있어서, 다음 실행 때 로그인 세션과 열어둔 탭을 그대로 재사용한다.
+    """
+    endpoint = f"http://127.0.0.1:{cfg['cdp_port']}"
+    headless = cfg["headless"]
+    launched = False
+    proc = None
+
+    # 창숨김은 어디까지나 '가능하면' 이다. 안 되는 상황이면 조용히 창을 띄운다.
+    # 실행 파일 하나로 끝내려면, 막다른 길을 만들지 않는 게 중요하다.
+    if headless and _debug_port_alive(endpoint):
+        print("[i] 자동화용 크롬 창이 이미 떠 있어서 그 창을 씁니다. (창숨김 해제)")
+        headless = cfg["headless"] = False
+
+    if not _debug_port_alive(endpoint):
+        profile = Path(cfg["profile_dir"])
+        if headless and not any(profile.glob("**/Cookies")):
+            print("[i] 아직 SWEA 로그인 기록이 없어서 이번엔 창을 띄웁니다.")
+            print("    로그인해두면 다음 실행부터 창숨김으로 돕니다.")
+            headless = cfg["headless"] = False
+        profile.mkdir(parents=True, exist_ok=True)
+        exe, kind = bootstrap.ensure_browser(pw.chromium.executable_path,
+                                             auto_yes=cfg.get("auto_yes", False))
+        if not exe:
+            sys.exit(f"브라우저를 준비하지 못했습니다 ({kind}).")
+        if kind != "playwright Chromium":
+            print(f"[i] PC 에 있는 {kind} 를 씁니다. (Chromium 을 따로 받지 않아도 됩니다)")
+        cmd = [
+            exe,
+            f"--remote-debugging-port={cfg['cdp_port']}",
+            f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            # 시작 페이지는 반드시 about:blank.
+            # 느린 페이지를 첫 타깃으로 열면 CDP 핸드셰이크가 타임아웃난다.
+            "about:blank",
+        ]
+        cmd[-1:-1] = ["--headless=new", "--window-size=1400,1000"] if headless else ["--start-maximized"]
+        creation = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        proc = subprocess.Popen(cmd, creationflags=creation, close_fds=True)
+        print("[i] 브라우저를 " + ("창 없이(창숨김) 띄웠습니다" if headless else "새로 띄웠습니다")
+              + f" (프로필: {profile})")
+        launched = True
+
+        for _ in range(30):
+            time.sleep(1)
+            if _debug_port_alive(endpoint):
+                break
+        else:
+            sys.exit(f"브라우저가 뜨지 않았습니다 ({endpoint}).\n"
+                     "  대부분은 이전에 쓰던 자동화용 크롬이 아직 살아 있어서입니다.\n"
+                     "  작업 관리자에서 chrome.exe 를 정리하거나 PC를 재시작한 뒤 다시 실행해주세요.\n"
+                     f"  그래도 안 되면 {SETTINGS_FILE} 의 '포트' 를 9223 등으로 바꿔보세요.")
+    else:
+        print(f"[i] 실행 중인 브라우저를 찾았습니다 ({endpoint})")
+
+    try:
+        browser = pw.chromium.connect_over_cdp(endpoint, timeout=30000)
+    except Exception as e:
+        sys.exit(f"브라우저에 연결하지 못했습니다 ({endpoint}): {type(e).__name__}\n"
+                 f"자동화용 크롬 창을 모두 닫고 다시 실행해보세요.")
+    if not browser.contexts:
+        sys.exit("브라우저 컨텍스트를 찾지 못했습니다. 창을 닫고 다시 실행해주세요.")
+    return browser.contexts[0], launched, proc
+
+
+def find_swea_page(ctx, url, headless=False):
+    """작업 대상 페이지를 정한다. url 이 있으면 그 URL 로, 없으면 열린 SWEA 탭을 찾는다."""
+    if url:
+        page = ctx.new_page()
+        page.goto(url, wait_until="domcontentloaded")
+        return page
+
+    if headless:
+        sys.exit("창숨김 모드에서는 문제 목록 주소가 필요합니다.\n"
+                 f"  {SETTINGS_FILE} 의 '문제목록' 에 그날 문제 박스 주소를 붙여넣거나,\n"
+                 "  python swea_sync.py \"<문제목록 주소>\" 처럼 실행해주세요.\n"
+                 "  (창을 띄워 쓰는 방식이면 창숨김 = 아니오 로 두면 됩니다)")
+
+    page = _pick_list_tab(ctx)
+    if page:
+        print(f"[i] 열려 있는 SWEA 탭을 사용합니다:\n    {page.url}")
+        return page
+
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    if SWEA_HOST not in page.url:
+        goto_landing(page)
+    print()
+    print("  브라우저 오른쪽 위 '로그인' 으로 로그인한 뒤,")
+    print("  Solving Club > 우리 반 클럽 > 오늘 풀 '문제 박스' 페이지를 열어주세요.")
+    try:
+        input("  준비되면 이 창에서 Enter > ")
+    except (EOFError, KeyboardInterrupt):
+        sys.exit("\n입력을 받지 못해 중단했습니다.")
+    return _pick_list_tab(ctx) or page
+
+
+def goto_landing(page):
+    """로그인부터 시작할 수 있게 SWEA 메인 페이지를 연다."""
+    for url in LANDING_URLS:
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            if resp is None or resp.ok:
+                return url
+        except Exception:
+            continue
+    return None
+
+
+def _pick_list_tab(ctx):
+    """열린 탭 중 '문제 목록'에 가장 가까운 탭을 고른다.
+
+    1순위: 실제로 문제 행(.widget-box-sub)이 그려져 있는 SWEA 탭
+    2순위: URL 에 probBoxId / problemBox 가 있는 SWEA 탭
+    """
+    fallback = None
+    for page in ctx.pages:
+        try:
+            u = page.url
+        except Exception:
+            continue
+        if SWEA_HOST not in u:
+            continue
+        try:
+            if page.locator(ROW_SELECTOR).count():
+                return page
+        except Exception:
+            pass
+        if fallback is None and any(h in u for h in LIST_URL_HINTS):
+            fallback = page
+    return fallback
+
+
+# ---------------------------------------------------------------- scraping
+
+DIFF_RE = re.compile(r"\bD[1-5]\b")
+
+
+def norm(text):
+    text = unicodedata.normalize("NFC", text or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+ROW_SELECTOR = ".widget-box-sub"
+CLICK_PROBLEM_RE = re.compile(r"""clickProblem\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]""")
+BOX_TITLE_RE = re.compile(r"^(.*?)\s*\(\s*(\d+)\s*\)\s*$")
+
+
+def collect_problems(page):
+    """문제 박스(problemBoxDetail.do) 페이지에서 문제들을 긁는다.
+
+    실제 DOM 구조:
+      <div class="widget-box-sub">
+        <span class="week_num">4836 .</span>
+        <span class="week_text">
+          <a href="javascript:clickProblem('CCCCprobIdCCCC','PROBLEM');">제목</a>
+        </span>
+        <span class="badge badge-a">D2 </span>
+      </div>
+    번호·제목·난이도·contestProbId·type 이 전부 목록에 있어서
+    상세 페이지를 열지 않고도 readme 에 쓸 링크를 그대로 조립할 수 있다.
+    """
+    page.wait_for_load_state("domcontentloaded")
+    try:
+        page.wait_for_selector(ROW_SELECTOR, timeout=15000)
+    except PWTimeout:
+        return [], {}
+
+    # 페이지 전역 값: 링크를 조립하는 데 필요하다
+    ctxinfo = page.evaluate(
+        """() => {
+            const v = id => (document.getElementById(id) || {}).value || '';
+            const h4 = document.querySelector('.right_con .club_box_tit')
+                    || document.querySelector('.club_box_tit');
+            return {
+                solveclubId: v('solveclubId'),
+                probBoxId:   v('probBoxId'),
+                boxTitleRaw: h4 ? (h4.innerText || '').trim() : ''
+            };
+        }"""
+    )
+    m = BOX_TITLE_RE.match(ctxinfo.get("boxTitleRaw", ""))
+    ctxinfo["boxTitle"] = m.group(1).strip() if m else norm(ctxinfo.get("boxTitleRaw", ""))
+    ctxinfo["boxCnt"] = m.group(2) if m else ""
+
+    rows = page.eval_on_selector_all(
+        ROW_SELECTOR,
+        """els => els.map(el => {
+            const q = s => el.querySelector(s);
+            const num  = q('.week_num');
+            const link = q('.week_text a');
+
+            // 제목: 이미 푼 문제는 앵커 안에 <span class="badge">정답</span> 이 들어온다.
+            // 배지를 떼고 순수 제목만 뽑는다.
+            let title = '';
+            if (link) {
+                const clone = link.cloneNode(true);
+                clone.querySelectorAll('.badge').forEach(b => b.remove());
+                title = (clone.textContent || '').trim();
+            }
+
+            // 난이도: 오른쪽 툴바의 배지가 난이도다.
+            // (앵커 안 '정답' 배지를 집지 않도록 D1~D5 형태인지 확인한다)
+            let diff = '';
+            const toolbar = q('.widget-toolbar-sub .badge');
+            if (toolbar) diff = (toolbar.textContent || '').trim();
+            if (!/\\bD[1-5]\\b/.test(diff)) {
+                diff = '';
+                for (const b of el.querySelectorAll('.badge')) {
+                    const t = (b.textContent || '').trim();
+                    if (/^D[1-5]$/.test(t)) { diff = t; break; }
+                }
+            }
+
+            return {
+                num:   num  ? (num.textContent || '').trim() : '',
+                title: title,
+                href:  link ? (link.getAttribute('href') || '') : '',
+                badge: diff
+            };
+        })""",
+    )
+
+    out, seen = [], set()
+    for r in rows:
+        mm = CLICK_PROBLEM_RE.search(r["href"] or "")
+        if not mm:
+            continue
+        cid, ptype = mm.group(1), mm.group(2)
+        if cid in seen:
+            continue
+        seen.add(cid)
+
+        num = re.sub(r"\D", "", r["num"] or "")
+        title = norm(r["title"])
+        dm = DIFF_RE.search(norm(r["badge"]))
+
+        out.append({
+            "number": num or None,
+            "title": title or None,
+            "difficulty": dm.group(0) if dm else None,
+            "contest_prob_id": cid,
+            "type": ptype,
+            "url": build_problem_url(ctxinfo, cid, ptype),
+        })
+    return out, ctxinfo
+
+
+def build_problem_url(ctxinfo, contest_prob_id, ptype):
+    """team-E readme 에 쓰던 것과 동일한 형태의 바로가기 링크를 만든다."""
+    params = {
+        "solveclubId": ctxinfo.get("solveclubId", ""),
+        "contestProbId": contest_prob_id,
+        "probBoxId": ctxinfo.get("probBoxId", ""),
+        "type": ptype,
+        "problemBoxTitle": ctxinfo.get("boxTitle", ""),
+        "problemBoxCnt": ctxinfo.get("boxCnt", ""),
+    }
+    query = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in params.items())
+    return f"https://{SWEA_HOST}/main/talk/solvingClub/problemView.do?{query}"
+
+
+def _say(ui, msg):
+    """실행 중 한 줄 알림. ui 가 있으면 꾸며서, 없으면 기존 형식으로."""
+    if ui:
+        ui.step(msg)
+    else:
+        print(f"      - {msg}")
+
+
+# 1순위가 실제로 확인된 셀렉터. 나머지는 페이지가 바뀔 때를 위한 예비.
+DOWNLOAD_SELECTORS = [
+    'a[href*="Down.do"][href*="downType=in"]',
+    'a[href*="downType=in"]',
+    'a[href*="contestProbDown.do"]',
+    'a[href*="fileDownload"]',
+    "a[download]",
+]
+
+
+def download_sample_input(page, dest_dir, force, ui=None):
+    """sample input 링크를 찾아 SWEA 원본 파일명 그대로 저장한다.
+
+    SWEA 는 링크 텍스트 자체가 파일명이다 (예: "sample_input.txt", "input.txt").
+    그래서 링크 텍스트를 1순위로 쓰고, 없으면 브라우저가 알려준 이름을 쓴다.
+    """
+    for sel in DOWNLOAD_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if not loc.count():
+                continue
+            link_name = norm(loc.inner_text())
+            with page.expect_download(timeout=20000) as dl_info:
+                loc.click()
+            dl = dl_info.value
+            name = link_name if link_name.lower().endswith(".txt") else ""
+            name = name or dl.suggested_filename or "sample_input.txt"
+            name = Path(name).name  # 경로 구분자 방어
+            target = dest_dir / name
+            if target.exists() and not force:
+                _say(ui, f"input 이미 있음, 건너뜀: {name}")
+                return name
+            dl.save_as(str(target))
+            _say(ui, f"input 저장: {name}")
+            return name
+        except PWTimeout:
+            continue
+        except Exception:
+            continue
+    return None
+
+
+def dump_anchors(page, label):
+    anchors = page.eval_on_selector_all(
+        "a",
+        "els => els.slice(0,400).map(a => ((a.innerText||'').trim().slice(0,40)) + ' || ' + a.getAttribute('href'))",
+    )
+    print(f"      [inspect] {label} 의 링크 {len(anchors)}개:")
+    for a in anchors:
+        tail = a.split("||")[-1].strip()
+        if tail and tail not in ("None", "#", "javascript:;"):
+            print("        ", a)
+
+
+# ---------------------------------------------------------------- output
+
+# 윈도우 폴더명에 쓸 수 없는 글자.  [S/W 문제해결 기본] 처럼 제목에 '/' 가 흔하다.
+BAD_PATH_CHARS = str.maketrans({c: "-" for c in '\\/:*?"<>|'})
+TITLE_MAX = 50          # 경로가 너무 길어지지 않게 제목 부분만 잘라낸다
+
+
+def safe_folder_title(title):
+    """문제 제목을 폴더명에 쓸 수 있게 다듬는다."""
+    name = norm(title).translate(BAD_PATH_CHARS)
+    name = re.sub(r"-{2,}", "-", name)            # '- -' 처럼 겹친 하이픈 정리
+    name = name.strip(" .-")                      # 윈도우는 끝의 점/공백을 못 쓴다
+    if len(name) > TITLE_MAX:
+        name = name[:TITLE_MAX].rstrip(" .-") + "…"
+    return name
+
+
+BOX_MAX = 30            # 박스 이름도 길어질 수 있으니 잘라둔다
+
+
+def problem_folder(day_dir, number, title, with_title, box_name=""):
+    """이 문제가 쓸 폴더를 정한다.
+
+    형태:  SWEA-<번호>[(<박스>)][-<제목>]
+      예)  SWEA-4875
+           SWEA-4875-[S-W 문제해결 기본] 5일차 - 미로
+           SWEA-4875(Stack2_1)-[S-W 문제해결 기본] 5일차 - 미로
+
+    이미 SWEA-<번호> 로 시작하는 폴더가 있으면 그걸 그대로 쓴다.
+    설정을 바꿨다고 해서 같은 문제에 폴더가 두 개 생기면 안 되기 때문이다.
+    (`SWEA-122*` 처럼 뭉뚱그리면 SWEA-1222 와 SWEA-12234 가 섞이므로
+     구분자까지 붙여 정확히 매칭한다)
+    """
+    existing = find_existing_folder(day_dir, number)
+    if existing:
+        return existing
+    return day_dir / desired_folder_name(number, title, with_title, box_name)
+
+
+def find_existing_folder(day_dir, number):
+    """이 문제로 이미 만들어 둔 폴더를 찾는다. 없으면 None.
+
+    `SWEA-122*` 처럼 뭉뚱그리면 SWEA-1222 와 SWEA-12234 가 섞이므로
+    구분자까지 붙여 정확히 매칭한다.
+    """
+    for pat in (f"SWEA-{number}", f"SWEA-{number}-*", f"SWEA-{number}(*"):
+        for p in sorted(day_dir.glob(pat)):
+            if p.is_dir():
+                return p
+    return None
+
+
+def desired_folder_name(number, title, with_title, box_name=""):
+    """지금 설정대로라면 이 문제의 폴더 이름은 무엇인지."""
+    name = f"SWEA-{number}"
+    if box_name:
+        box = safe_folder_title(box_name)[:BOX_MAX].strip(" .-")
+        if box:
+            name += f"({box})"
+    if with_title:
+        pretty = safe_folder_title(title)
+        if pretty:
+            name += f"-{pretty}"
+    return name
+
+
+def plan_renames(day_dir, problems, box_title, cfg):
+    """이름이 달라진 폴더들을 찾아 (지금 폴더, 바꿀 폴더) 목록으로 돌려준다."""
+    pairs = []
+    for prob in problems:
+        number, title = prob.get("number"), prob.get("title")
+        if not number or not title:
+            continue
+        old = find_existing_folder(day_dir, number)
+        if not old:
+            continue
+        want = desired_folder_name(number, title, cfg["folder_title"],
+                                   box_title if cfg["folder_box"] else "")
+        if old.name != want:
+            pairs.append((old, day_dir / want))
+    return pairs
+
+
+def apply_renames(pairs):
+    """폴더 이름을 바꾼다. 반환: (성공 목록, 실패 목록[(폴더, 사유)])"""
+    done, failed = [], []
+    for old, new in pairs:
+        try:
+            if new.exists():
+                failed.append((old.name, f"'{new.name}' 이 이미 있습니다"))
+                continue
+            old.rename(new)
+            done.append((old.name, new.name))
+        except OSError as e:
+            # 폴더 안 파일이 편집기 등에서 열려 있으면 윈도우가 막는다
+            failed.append((old.name, f"{type(e).__name__}: {e}"))
+    return done, failed
+
+
+README_TMPL = "# {title}{diff}\r\n\r\n## [바로가기]({url})\r\n"
+
+
+def write_readme(dest_dir, title, difficulty, url, force, ui=None):
+    path = dest_dir / "readme.md"
+    body = README_TMPL.format(
+        title=title,
+        diff=(" " + difficulty) if difficulty else "",
+        url=url,
+    )
+    if path.exists() and not force:
+        old = path.read_bytes().decode("utf-8", "replace")
+        if old == body:
+            _say(ui, "readme.md 동일, 건너뜀")
+            return False
+    path.write_bytes(body.encode("utf-8"))
+    _say(ui, "readme.md 작성")
+    return True
+
+
+# ---------------------------------------------------------------- main
+
+def run_sync(cfg, args, dry_run=False, ui=None):
+    """실제 동기화 작업. ui 가 주어지면 꾸민 화면으로, 없으면 평범한 print 로 출력한다."""
+    day_dir = Path(cfg["repo_path"]) / "daily" / cfg["date"] / cfg["team"]
+
+    if ui is None:
+        print(f"[i] 설정      : {SETTINGS_FILE}  (경로={cfg['repo_path']} / 팀={cfg['team']} / 날짜={cfg['date']})")
+        shape = "SWEA-<번호>"
+        if cfg["folder_box"]:
+            shape += "(<박스>)"
+        if cfg["folder_title"]:
+            shape += "-<제목>"
+        print(f"[i] 폴더이름  : {shape}   |  readme.md {'생성' if cfg['readme'] else '생성 안 함'}")
+        print(f"[i] 대상 폴더 : {day_dir}")
+
+    # 창이 갑자기 뜨기 전에 무엇을 해야 하는지 먼저 알려준다.
+    # 이미 떠 있거나 창숨김이면 알릴 필요가 없다.
+    if ui and not cfg["headless"] and not bootstrap.browser_running(cfg["cdp_port"]):
+        if not ui.browser_notice(need_navigation=not cfg["list_url"]):
+            ui.notice("취소했습니다.")
+            return 1
+
+    with sync_playwright() as pw:
+        ctx, launched, proc = attach_browser(pw, cfg)
+        ctx.set_default_timeout(20000)
+        page = find_swea_page(ctx, cfg["list_url"], cfg["headless"])
+
+        problems, boxinfo = collect_problems(page)
+        if not problems:
+            msg = "문제 목록을 찾지 못했습니다. 로그인이 풀렸거나 문제 박스 페이지가 아닙니다."
+            if ui:
+                ui.error(msg)
+            else:
+                print(f"[!] {msg}")
+            if args.inspect:
+                out = HERE / "inspect_list.html"
+                out.write_text(page.content(), encoding="utf-8")
+                print(f"    - 페이지 HTML 덤프: {out}")
+                dump_anchors(page, "목록 페이지")
+            return 1
+
+        expected = boxinfo.get("boxCnt")
+        short = bool(expected and expected.isdigit() and len(problems) < int(expected))
+
+        if ui:
+            ui.box_header(boxinfo.get("boxTitle"), expected, len(problems))
+        else:
+            print(f"[i] 문제 박스 : {boxinfo.get('boxTitle')} ({expected})")
+            print(f"[i] 문제 {len(problems)}개 발견")
+        if short:
+            note = (f"이 박스에는 {expected}개가 있는데 {len(problems)}개만 읽었습니다. "
+                    "목록 아래 '30개씩 보기' 로 바꾼 뒤 다시 실행해주세요.")
+            ui.warn(note) if ui else print(f"[!] {note}")
+        if not ui:
+            print()
+
+        # 설정이 바뀌어 기존 폴더 이름이 지금 규칙과 다르면, 물어보고 바꾼다.
+        # 바꾸기 전에 무엇이 어떻게 바뀌는지 먼저 보여준다.
+        if cfg["rename_folders"] and not dry_run:
+            pairs = plan_renames(day_dir, problems, boxinfo.get("boxTitle", ""), cfg)
+            if pairs:
+                go = True
+                if ui:
+                    go = ui.rename_preview(pairs)
+                else:
+                    print("[i] 폴더 이름을 바꿉니다:")
+                    for old, new in pairs:
+                        print(f"      {old.name}\n   -> {new.name}")
+                if go:
+                    done, failed = apply_renames(pairs)
+                    if ui:
+                        ui.rename_result(done, failed)
+                    else:
+                        for name, why in failed:
+                            print(f"[!] {name} : {why}")
+
+        work = None if dry_run else ctx.new_page()
+        made, rows = 0, []
+        for i, prob in enumerate(problems, 1):
+            number, title, diff = prob["number"], prob["title"], prob["difficulty"]
+            if not number or not title:
+                m = f"번호/제목을 못 읽어 건너뜁니다: {prob['contest_prob_id']}"
+                ui.warn(m) if ui else print(f"  {i}. [!] {m}")
+                continue
+
+            box_name = boxinfo.get("boxTitle", "") if cfg["folder_box"] else ""
+            dest = problem_folder(day_dir, number, title, cfg["folder_title"], box_name)
+            folder = dest.name
+
+            if dry_run:
+                if ui:
+                    rows.append((f"SWEA-{number}", folder, title, diff, "만들 예정"))
+                else:
+                    print(f"  {i}. {folder}  |  {title}  |  {diff or '난이도?'}")
+                    print(f"      (dry-run) {dest}")
+                made += 1
+                continue
+
+            if ui:
+                ui.problem_line(i, folder, title, diff)
+            else:
+                print(f"  {i}. {folder}  |  {title}  |  {diff or '난이도?'}")
+
+            dest.mkdir(parents=True, exist_ok=True)
+            if cfg["readme"]:
+                write_readme(dest, title, diff, prob["url"], args.force, ui=ui)
+
+            work.goto(prob["url"], wait_until="domcontentloaded")
+            work.wait_for_timeout(800)
+            name = download_sample_input(work, dest, args.force, ui=ui)
+            if not name:
+                m = "sample input 다운로드 링크를 못 찾았습니다"
+                ui.step(m, ok=False) if ui else print(f"      - [!] {m}")
+                if args.inspect:
+                    dump_anchors(work, folder)
+            made += 1
+
+        if ui:
+            if dry_run:
+                ui.problem_table(rows, dry_run=True)
+            ui.done(made, day_dir, dry_run=dry_run)
+        else:
+            print(f"\n[완료] {made}개 문제 폴더 처리  ->  {day_dir}")
+
+        if work:
+            work.close()
+        if launched and cfg["headless"]:
+            try:
+                ctx.browser.close()
+            except Exception:
+                pass
+            kill_process_tree(proc)
+            (ui.notice if ui else print)("창숨김으로 띄운 브라우저를 닫았습니다.")
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description="SWEA solving club -> 팀 레포 동기화")
+    ap.add_argument("url", nargs="?", help="그날의 문제 목록(problem box) URL. 생략하면 열린 탭을 사용")
+    ap.add_argument("--date", help=f"daily/<날짜> (기본: {SETTINGS_FILE} 의 '날짜', 비어 있으면 오늘)")
+    ap.add_argument("--team", help=f"팀 폴더명 (기본: {SETTINGS_FILE} 의 '팀')")
+    ap.add_argument("--repo", help=f"algorithm 레포 경로 (기본: {SETTINGS_FILE} 의 '경로')")
+    ap.add_argument("--force", action="store_true", help="이미 있는 readme/input 도 덮어쓰기")
+    ap.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않고 무엇을 만들지만 출력")
+    ap.add_argument("--inspect", action="store_true", help="페이지 HTML/링크 덤프 (셀렉터 튜닝용)")
+    ap.add_argument("--headless", action="store_true", help="크롬 창을 띄우지 않고 실행 (문제 목록 주소 필요)")
+    ap.add_argument("--show", action="store_true", help="창숨김 설정을 무시하고 창을 띄움 (로그인할 때)")
+    ap.add_argument("--folder-title", action="store_true", help="폴더명에 문제 제목까지 넣기")
+    ap.add_argument("--no-folder-title", action="store_true", help="폴더명을 SWEA-<번호> 로만")
+    ap.add_argument("--folder-box", action="store_true", help="폴더명에 문제 박스 이름까지 넣기")
+    ap.add_argument("--no-folder-box", action="store_true", help="폴더명에서 박스 이름 빼기")
+    ap.add_argument("--no-readme", action="store_true", help="readme.md 를 만들지 않음")
+    ap.add_argument("--rename-folders", action="store_true",
+                    help="이미 있는 폴더 이름을 지금 설정에 맞게 바꿈")
+    ap.add_argument("--no-rename-folders", action="store_true",
+                    help="폴더 이름을 바꾸지 않음")
+    ap.add_argument("-y", "--yes", action="store_true", help="설치 여부를 묻지 않고 진행")
+    ap.add_argument("--menu", action="store_true", help="메뉴 화면으로 시작")
+    ap.add_argument("--no-menu", action="store_true", help="메뉴 없이 바로 실행")
+    return ap
+
+
+def wants_menu(args) -> bool:
+    """메뉴를 띄울지 판단한다.
+
+    사람이 터미널에서 옵션 없이 실행했을 때만 띄운다.
+    배치나 자동 실행에서 메뉴가 뜨면 입력을 기다리다 멈춰버리기 때문이다.
+    """
+    if args.no_menu:
+        return False
+    if args.menu:
+        return True
+    try:
+        if not sys.stdin.isatty():
+            return False
+    except Exception:
+        return False
+    given = (args.url, args.date, args.team, args.repo)
+    flags = (args.force, args.dry_run, args.inspect, args.headless, args.show,
+             args.folder_title, args.no_folder_title, args.folder_box,
+             args.no_folder_box, args.no_readme,
+             args.rename_folders, args.no_rename_folders)
+    return not any(given) and not any(flags)
+
+
+def menu_loop(args):
+    """메뉴 화면. 설정을 보고, 고치고, 실행한다."""
+    import ui
+
+    settings_path = HERE / SETTINGS_FILE
+    save = lambda k, v: set_setting_value(settings_path, k, v)
+
+    def read_cfg():
+        cfg = load_config(args, strict=False)
+        cfg["auto_yes"] = args.yes
+        return cfg, read_settings_file(settings_path)[0]
+
+    def draw(cfg):
+        """화면을 새로 그린다. 쌓지 않고 지우고 다시 그려야 화면 전환처럼 보인다."""
+        ui.clear()
+        ui.banner()
+        ui.settings_panel(cfg, SETTINGS_FILE)
+        ui.show_flash()
+
+    while True:
+        cfg, raw_values = read_cfg()
+        draw(cfg)
+        try:
+            action = ui.main_menu()
+        except KeyboardInterrupt:
+            action = "quit"
+
+        if action == "quit":
+            ui.notice("끝냅니다.")
+            return 0
+
+        if action == "edit":
+            # 한 항목 고칠 때마다 메인으로 튕기지 않도록 설정 화면에 머문다
+            while True:
+                cfg, raw_values = read_cfg()
+                draw(cfg)
+                try:
+                    stay = ui.edit_settings(cfg, raw_values, save)
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    # 설정 고치다 난 오류로 프로그램 전체가 죽으면 안 된다
+                    ui.error(f"설정을 바꾸지 못했습니다 - {type(e).__name__}: {e}")
+                    ui.pause()
+                    break
+                if not stay:
+                    break
+            continue
+
+        cfg, _ = read_cfg()
+        if not cfg["repo_path"] or not Path(cfg["repo_path"]).exists():
+            ui.error(f"레포 경로가 없습니다: {cfg['repo_path'] or '(비어 있음)'}")
+            ui.notice("'설정 바꾸기' 에서 경로를 고쳐주세요.")
+            ui.pause()
+            continue
+
+        ui.clear()
+        try:
+            run_sync(cfg, args, dry_run=(action == "dry"), ui=ui)
+        except KeyboardInterrupt:
+            ui.warn("중단했습니다.")
+        except Exception as e:
+            ui.error(f"{type(e).__name__}: {e}")
+        ui.pause()
+
+
+def run_setup_if_needed(args) -> bool:
+    """경로/팀이 아직 비어 있으면 물어봐서 settings.txt 에 채운다.
+
+    settings.txt 를 미리 손으로 고치지 않아도 첫 실행이 되도록 하는 게 목적이다.
+    사람이 없는 실행(배치 등)에서는 물어볼 수 없으니 건너뛴다.
+    """
+    settings_path = HERE / SETTINGS_FILE
+    cfg = load_config(args, strict=False)
+    if cfg["repo_path"] and cfg["team"]:
+        return True
+
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        return True                     # 물어볼 수 없으면 기존 안내로 넘긴다
+
+    import ui
+    got = ui.setup_wizard(check_repo_path, cfg["repo_path"], cfg["team"])
+    if not got:
+        ui.notice("설정하지 않았습니다.")
+        return False
+    for key, value in got.items():
+        set_setting_value(settings_path, key, value)
+    return True
+
+
+def main():
+    args = build_parser().parse_args()
+
+    # 필요한 패키지가 없으면 여기서 설치한다 (playwright import 보다 먼저)
+    if not bootstrap.ensure_packages(auto_yes=args.yes):
+        return 1
+    load_playwright()
+
+    # 경로/팀이 비어 있으면 여기서 물어본다 (settings.txt 를 미리 안 고쳐도 되게)
+    if not run_setup_if_needed(args):
+        return 1
+
+    if wants_menu(args):
+        return menu_loop(args)
+
+    cfg = load_config(args)
+    cfg["auto_yes"] = args.yes
+    if not Path(cfg["repo_path"]).exists():
+        sys.exit(f"레포 경로가 없습니다: {cfg['repo_path']}\n"
+                 f"  {SETTINGS_FILE} 의 '경로' 를 확인해주세요.")
+    return run_sync(cfg, args, dry_run=args.dry_run, ui=None)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
