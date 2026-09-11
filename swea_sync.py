@@ -81,6 +81,7 @@ KEY_ALIASES = {
     "folder_box":  ("폴더에박스", "폴더박스", "박스이름", "folderbox", "folder_box"),
     "readme":      ("readme", "readme생성", "리드미", "설명파일"),
     "rename_folders": ("폴더이름갱신", "이름갱신", "폴더갱신", "renamefolders", "rename_folders"),
+    "layout":      ("폴더구조", "경로구조", "구조", "디렉토리", "layout", "folder_layout", "structure"),
     "profile_dir": ("브라우저프로필", "프로필", "profile", "profile_dir"),
     "cdp_port":    ("포트", "port", "cdp_port"),
 }
@@ -222,6 +223,7 @@ def load_config(args, strict=True) -> dict:
         "folder_box": "",       # 폴더명에 문제 박스 이름까지 넣을지
         "readme": "예",          # readme.md 를 만들지 (기본: 만든다)
         "rename_folders": "",   # 이미 있는 폴더 이름을 지금 설정에 맞게 바꿀지
+        "layout": "",           # 문제 폴더들이 들어갈 상위 경로 (레포 기준 상대 경로)
         "profile_dir": "",
         "cdp_port": 9222,
     }
@@ -241,6 +243,13 @@ def load_config(args, strict=True) -> dict:
         cfg["date"] = args.date
     if args.url:
         cfg["list_url"] = args.url
+    if getattr(args, "layout", None):
+        cfg["layout"] = args.layout
+
+    try:
+        cfg["layout"] = check_layout(cfg["layout"])
+    except ValueError as e:
+        sys.exit(f"{SETTINGS_FILE} 의 '폴더구조' 가 잘못됐습니다.\n  {e}")
 
     cfg["headless"] = parse_bool(cfg["headless"], "창숨김")
     if args.headless:
@@ -493,83 +502,74 @@ CLICK_PROBLEM_RE = re.compile(r"""clickProblem\(\s*['"]([^'"]+)['"]\s*,\s*['"]([
 BOX_TITLE_RE = re.compile(r"^(.*?)\s*\(\s*(\d+)\s*\)\s*$")
 
 
-def collect_problems(page):
-    """문제 박스(problemBoxDetail.do) 페이지에서 문제들을 긁는다.
+ROWS_JS = """els => els.map(el => {
+    const q = s => el.querySelector(s);
+    const num  = q('.week_num');
+    const link = q('.week_text a');
 
-    실제 DOM 구조:
-      <div class="widget-box-sub">
-        <span class="week_num">4836 .</span>
-        <span class="week_text">
-          <a href="javascript:clickProblem('CCCCprobIdCCCC','PROBLEM');">제목</a>
-        </span>
-        <span class="badge badge-a">D2 </span>
-      </div>
-    번호·제목·난이도·contestProbId·type 이 전부 목록에 있어서
-    상세 페이지를 열지 않고도 readme 에 쓸 링크를 그대로 조립할 수 있다.
-    """
-    page.wait_for_load_state("domcontentloaded")
-    try:
-        page.wait_for_selector(ROW_SELECTOR, timeout=15000)
-    except PWTimeout:
-        return [], {}
+    // 제목: 이미 푼 문제는 앵커 안에 <span class="badge">정답</span> 이 들어온다.
+    // 배지를 떼고 순수 제목만 뽑는다.
+    let title = '';
+    if (link) {
+        const clone = link.cloneNode(true);
+        clone.querySelectorAll('.badge').forEach(b => b.remove());
+        title = (clone.textContent || '').trim();
+    }
 
-    # 페이지 전역 값: 링크를 조립하는 데 필요하다
-    ctxinfo = page.evaluate(
-        """() => {
-            const v = id => (document.getElementById(id) || {}).value || '';
-            const h4 = document.querySelector('.right_con .club_box_tit')
-                    || document.querySelector('.club_box_tit');
-            return {
-                solveclubId: v('solveclubId'),
-                probBoxId:   v('probBoxId'),
-                boxTitleRaw: h4 ? (h4.innerText || '').trim() : ''
-            };
-        }"""
-    )
-    m = BOX_TITLE_RE.match(ctxinfo.get("boxTitleRaw", ""))
-    ctxinfo["boxTitle"] = m.group(1).strip() if m else norm(ctxinfo.get("boxTitleRaw", ""))
-    ctxinfo["boxCnt"] = m.group(2) if m else ""
+    // 난이도: 오른쪽 툴바의 배지가 난이도다.
+    // (앵커 안 '정답' 배지를 집지 않도록 D1~D5 형태인지 확인한다)
+    let diff = '';
+    const toolbar = q('.widget-toolbar-sub .badge');
+    if (toolbar) diff = (toolbar.textContent || '').trim();
+    if (!/\\bD[1-5]\\b/.test(diff)) {
+        diff = '';
+        for (const b of el.querySelectorAll('.badge')) {
+            const t = (b.textContent || '').trim();
+            if (/^D[1-5]$/.test(t)) { diff = t; break; }
+        }
+    }
 
-    rows = page.eval_on_selector_all(
-        ROW_SELECTOR,
-        """els => els.map(el => {
-            const q = s => el.querySelector(s);
-            const num  = q('.week_num');
-            const link = q('.week_text a');
+    return {
+        num:   num  ? (num.textContent || '').trim() : '',
+        title: title,
+        href:  link ? (link.getAttribute('href') || '') : '',
+        badge: diff
+    };
+})"""
 
-            // 제목: 이미 푼 문제는 앵커 안에 <span class="badge">정답</span> 이 들어온다.
-            // 배지를 떼고 순수 제목만 뽑는다.
-            let title = '';
-            if (link) {
-                const clone = link.cloneNode(true);
-                clone.querySelectorAll('.badge').forEach(b => b.remove());
-                title = (clone.textContent || '').trim();
-            }
+BOX_INFO_JS = """() => {
+    const v = id => (document.getElementById(id) || {}).value || '';
+    const h4 = document.querySelector('.right_con .club_box_tit')
+            || document.querySelector('.club_box_tit');
+    // 클럽 이름은 왼쪽 패널 제목이다. (.club_name 은 회원 이름이라 쓰면 안 된다)
+    const club = document.querySelector('.left_con h3')
+              || document.querySelector('[class*=club_tit]');
+    return {
+        solveclubId: v('solveclubId'),
+        probBoxId:   v('probBoxId'),
+        boxTitleRaw: h4 ? (h4.innerText || '').trim() : '',
+        clubName:    club ? (club.innerText || '').trim() : ''
+    };
+}"""
 
-            // 난이도: 오른쪽 툴바의 배지가 난이도다.
-            // (앵커 안 '정답' 배지를 집지 않도록 D1~D5 형태인지 확인한다)
-            let diff = '';
-            const toolbar = q('.widget-toolbar-sub .badge');
-            if (toolbar) diff = (toolbar.textContent || '').trim();
-            if (!/\\bD[1-5]\\b/.test(diff)) {
-                diff = '';
-                for (const b of el.querySelectorAll('.badge')) {
-                    const t = (b.textContent || '').trim();
-                    if (/^D[1-5]$/.test(t)) { diff = t; break; }
-                }
-            }
+PAGE_SIZE = 30          # 사이트가 주는 최대값 (10 / 20 / 30)
+MAX_PAGES = 50          # 무한 루프 방지용 상한
 
-            return {
-                num:   num  ? (num.textContent || '').trim() : '',
-                title: title,
-                href:  link ? (link.getAttribute('href') || '') : '',
-                badge: diff
-            };
-        })""",
-    )
 
-    out, seen = [], set()
-    for r in rows:
+def read_box_info(page):
+    """문제 박스 페이지에서 링크 조립·폴더 이름에 필요한 전역 값을 읽는다."""
+    info = page.evaluate(BOX_INFO_JS)
+    m = BOX_TITLE_RE.match(info.get("boxTitleRaw", ""))
+    info["boxTitle"] = m.group(1).strip() if m else norm(info.get("boxTitleRaw", ""))
+    info["boxCnt"] = m.group(2) if m else ""
+    info["clubName"] = norm(info.get("clubName", ""))
+    return info
+
+
+def parse_rows(page, ctxinfo, seen):
+    """지금 보이는 페이지의 문제 행들을 읽는다. seen 에 있는 건 건너뛴다."""
+    out = []
+    for r in page.eval_on_selector_all(ROW_SELECTOR, ROWS_JS):
         mm = CLICK_PROBLEM_RE.search(r["href"] or "")
         if not mm:
             continue
@@ -581,7 +581,6 @@ def collect_problems(page):
         num = re.sub(r"\D", "", r["num"] or "")
         title = norm(r["title"])
         dm = DIFF_RE.search(norm(r["badge"]))
-
         out.append({
             "number": num or None,
             "title": title or None,
@@ -590,7 +589,73 @@ def collect_problems(page):
             "type": ptype,
             "url": build_problem_url(ctxinfo, cid, ptype),
         })
-    return out, ctxinfo
+    return out
+
+
+def box_page_url(ctxinfo, page_index, page_size=None):
+    """문제 박스의 N번째 페이지 주소. 사이트가 pageSize / pageIndex 를 GET 으로 받는다."""
+    if page_size is None:
+        page_size = PAGE_SIZE           # 기본 인자로 묶으면 정의 시점 값에 고정되므로 여기서 읽는다
+    return (f"https://{SWEA_HOST}/main/talk/solvingClub/problemBoxDetail.do"
+            f"?solveclubId={quote(ctxinfo.get('solveclubId', ''), safe='')}"
+            f"&probBoxId={quote(ctxinfo.get('probBoxId', ''), safe='')}"
+            f"&pageSize={page_size}&pageIndex={page_index}")
+
+
+def collect_problems(page, ctx=None, on_page=None):
+    """문제 박스의 문제를 전부 긁는다. 여러 페이지로 나뉘어 있으면 끝까지 넘긴다.
+
+    실제 DOM 구조:
+      <div class="widget-box-sub">
+        <span class="week_num">4836 .</span>
+        <span class="week_text">
+          <a href="javascript:clickProblem('CCCCprobIdCCCC','PROBLEM');">제목</a>
+        </span>
+        <span class="badge badge-a">D2 </span>
+      </div>
+    번호·제목·난이도·contestProbId·type 이 전부 목록에 있어서
+    상세 페이지를 열지 않고도 readme 에 쓸 링크를 그대로 조립할 수 있다.
+
+    페이지 넘기기는 사용자가 보고 있는 탭이 아니라 새 탭에서 한다.
+    (ctx 가 없으면 지금 탭 한 페이지만 읽는다)
+    """
+    page.wait_for_load_state("domcontentloaded")
+    try:
+        page.wait_for_selector(ROW_SELECTOR, timeout=15000)
+    except PWTimeout:
+        return [], {}
+
+    ctxinfo = read_box_info(page)
+    seen = set()
+    problems = parse_rows(page, ctxinfo, seen)
+
+    expected = int(ctxinfo["boxCnt"]) if str(ctxinfo["boxCnt"]).isdigit() else None
+    if expected is None or len(problems) >= expected or ctx is None \
+            or not ctxinfo.get("probBoxId"):
+        return problems, ctxinfo
+
+    # 한 페이지에 다 안 들어온다. 새 탭에서 30개씩으로 놓고 끝까지 넘긴다.
+    work = ctx.new_page()
+    try:
+        problems, seen = [], set()      # 30개씩 기준으로 처음부터 다시 읽는다
+        for idx in range(1, MAX_PAGES + 1):
+            work.goto(box_page_url(ctxinfo, idx), wait_until="domcontentloaded",
+                      timeout=60000)
+            try:
+                work.wait_for_selector(ROW_SELECTOR, timeout=8000)
+            except PWTimeout:
+                break                   # 행이 없는 페이지 = 끝
+            got = parse_rows(work, ctxinfo, seen)
+            if not got:
+                break                   # 새로 읽힌 게 없으면 끝
+            problems += got
+            if on_page:
+                on_page(idx, len(got), len(problems), expected)
+            if len(problems) >= expected:
+                break
+    finally:
+        work.close()
+    return problems, ctxinfo
 
 
 def build_problem_url(ctxinfo, contest_prob_id, ptype):
@@ -687,6 +752,89 @@ def safe_folder_title(title):
 
 
 BOX_MAX = 30            # 박스 이름도 길어질 수 있으니 잘라둔다
+
+
+# ---------------------------------------------------------------- 폴더 구조
+
+DEFAULT_LAYOUT = "daily/{날짜}/{팀}"
+
+# '{날짜}' 처럼 중괄호로 쓰는 자리표시자. 한글/영문 아무거나 된다.
+LAYOUT_PLACEHOLDERS = {
+    "날짜": "date",  "date": "date",
+    "년":   "year",  "year": "year",
+    "월":   "month", "month": "month",
+    "일":   "day",   "day": "day",
+    "팀":   "team",  "조": "team", "team": "team",
+    "클럽": "club",  "club": "club",
+    "박스": "box",   "box": "box",
+}
+PLACEHOLDER_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def layout_placeholders(template):
+    """템플릿에 쓰인 자리표시자들을 정규화된 이름으로 돌려준다. 모르는 게 있으면 ValueError."""
+    out, bad = set(), []
+    for raw in PLACEHOLDER_RE.findall(template or ""):
+        key = re.sub(r"\s+", "", raw).lower()
+        canon = LAYOUT_PLACEHOLDERS.get(key)
+        if canon:
+            out.add(canon)
+        else:
+            bad.append(raw)
+    if bad:
+        raise ValueError(
+            f"모르는 자리표시자: {', '.join('{' + b + '}' for b in bad)}\n"
+            "  쓸 수 있는 것: {날짜} {년} {월} {일} {팀} {클럽} {박스}")
+    return out
+
+
+def check_layout(template):
+    """폴더 구조 템플릿이 쓸 만한지 미리 본다. 값은 실행 때 채워지므로 형태만 본다."""
+    t = (template or "").strip().strip('"').strip("'")
+    if not t:
+        return DEFAULT_LAYOUT
+    layout_placeholders(t)                          # 모르는 자리표시자면 여기서 터진다
+    if re.match(r"^[A-Za-z]:", t) or t.startswith(("/", "\\")):
+        raise ValueError("폴더 구조는 레포 안의 상대 경로여야 합니다. 'C:/' 나 '/' 로 시작할 수 없습니다.")
+    for seg in re.split(r"[\\/]+", t):
+        if seg.strip() == "..":
+            raise ValueError("폴더 구조에 '..' 는 쓸 수 없습니다.")
+    return t
+
+
+def render_layout(template, values):
+    """템플릿에 실제 값을 채워 레포 아래 상대 경로(Path)를 만든다.
+
+    values: date / year / month / day / team / club / box
+    각 폴더 이름은 윈도우에서 못 쓰는 글자를 정리하고, 비어 있으면 건너뛴다.
+    """
+    def fill(m):
+        key = re.sub(r"\s+", "", m.group(1)).lower()
+        canon = LAYOUT_PLACEHOLDERS.get(key, key)
+        return str(values.get(canon, "") or "")
+
+    filled = PLACEHOLDER_RE.sub(fill, template)
+    parts = []
+    for seg in re.split(r"[\\/]+", filled):
+        seg = safe_folder_title(seg)
+        if seg and seg != "..":
+            parts.append(seg)
+    if not parts:
+        raise ValueError(f"폴더 구조 '{template}' 를 채웠더니 비어 버렸습니다. "
+                         "클럽/박스 이름을 못 읽었을 수 있습니다.")
+    return Path(*parts)
+
+
+def layout_values(cfg, boxinfo):
+    """render_layout 에 넣을 값들."""
+    d = cfg["date"]
+    y, mo, dd = (d.split("-") + ["", "", ""])[:3]
+    return {
+        "date": d, "year": y, "month": mo, "day": dd,
+        "team": cfg.get("team", ""),
+        "club": (boxinfo or {}).get("clubName", ""),
+        "box":  (boxinfo or {}).get("boxTitle", ""),
+    }
 
 
 def problem_folder(day_dir, number, title, with_title, box_name=""):
@@ -792,8 +940,6 @@ def write_readme(dest_dir, title, difficulty, url, force, ui=None):
 
 def run_sync(cfg, args, dry_run=False, ui=None):
     """실제 동기화 작업. ui 가 주어지면 꾸민 화면으로, 없으면 평범한 print 로 출력한다."""
-    day_dir = Path(cfg["repo_path"]) / "daily" / cfg["date"] / cfg["team"]
-
     if ui is None:
         print(f"[i] 설정      : {SETTINGS_FILE}  (경로={cfg['repo_path']} / 팀={cfg['team']} / 날짜={cfg['date']})")
         shape = "SWEA-<번호>"
@@ -802,7 +948,7 @@ def run_sync(cfg, args, dry_run=False, ui=None):
         if cfg["folder_title"]:
             shape += "-<제목>"
         print(f"[i] 폴더이름  : {shape}   |  readme.md {'생성' if cfg['readme'] else '생성 안 함'}")
-        print(f"[i] 대상 폴더 : {day_dir}")
+        print(f"[i] 폴더구조  : {cfg['layout']}  (클럽/박스 이름은 페이지를 읽은 뒤 채워집니다)")
 
     # 창이 갑자기 뜨기 전에 무엇을 해야 하는지 먼저 알려준다.
     # 이미 떠 있거나 창숨김이면 알릴 필요가 없다.
@@ -816,7 +962,10 @@ def run_sync(cfg, args, dry_run=False, ui=None):
         ctx.set_default_timeout(20000)
         page = find_swea_page(ctx, cfg["list_url"], cfg["headless"])
 
-        problems, boxinfo = collect_problems(page)
+        def _on_page(idx, got, total, expected):
+            msg = f"{idx}페이지: {got}개 읽음 (누적 {total}/{expected})"
+            ui.notice(msg) if ui else print(f"[i] {msg}")
+        problems, boxinfo = collect_problems(page, ctx=ctx, on_page=_on_page)
         if not problems:
             msg = "문제 목록을 찾지 못했습니다. 로그인이 풀렸거나 문제 박스 페이지가 아닙니다."
             if ui:
@@ -830,6 +979,24 @@ def run_sync(cfg, args, dry_run=False, ui=None):
                 dump_anchors(page, "목록 페이지")
             return 1
 
+        # 이제 클럽/박스 이름을 아니 폴더 구조를 채울 수 있다
+        try:
+            day_dir = Path(cfg["repo_path"]) / render_layout(cfg["layout"], layout_values(cfg, boxinfo))
+        except ValueError as e:
+            (ui.error if ui else print)(str(e))
+            return 1
+        if ui:
+            ui.notice(f"대상 폴더  {day_dir}")
+        else:
+            print(f"[i] 대상 폴더 : {day_dir}")
+
+        # 폴더구조에 {박스} 가 이미 들어가 있으면 문제 폴더 이름에까지 박스를 붙이는 건 중복이다
+        use_box_in_name = cfg["folder_box"]
+        if use_box_in_name and "box" in layout_placeholders(cfg["layout"]):
+            use_box_in_name = False
+            note = "폴더구조에 {박스} 가 있어서 문제 폴더 이름에는 박스를 넣지 않습니다."
+            ui.notice(note) if ui else print(f"[i] {note}")
+
         expected = boxinfo.get("boxCnt")
         short = bool(expected and expected.isdigit() and len(problems) < int(expected))
 
@@ -839,8 +1006,9 @@ def run_sync(cfg, args, dry_run=False, ui=None):
             print(f"[i] 문제 박스 : {boxinfo.get('boxTitle')} ({expected})")
             print(f"[i] 문제 {len(problems)}개 발견")
         if short:
-            note = (f"이 박스에는 {expected}개가 있는데 {len(problems)}개만 읽었습니다. "
-                    "목록 아래 '30개씩 보기' 로 바꾼 뒤 다시 실행해주세요.")
+            # 페이지를 끝까지 넘겼는데도 모자라면 사이트 쪽 문제다 (평소엔 안 뜬다)
+            note = (f"이 박스에는 {expected}개가 있는데 {len(problems)}개만 읽혔습니다. "
+                    "페이지를 끝까지 넘겼는데도 모자랍니다. 나중에 다시 실행해보세요.")
             ui.warn(note) if ui else print(f"[!] {note}")
         if not ui:
             print()
@@ -848,7 +1016,8 @@ def run_sync(cfg, args, dry_run=False, ui=None):
         # 설정이 바뀌어 기존 폴더 이름이 지금 규칙과 다르면, 물어보고 바꾼다.
         # 바꾸기 전에 무엇이 어떻게 바뀌는지 먼저 보여준다.
         if cfg["rename_folders"] and not dry_run:
-            pairs = plan_renames(day_dir, problems, boxinfo.get("boxTitle", ""), cfg)
+            pairs = plan_renames(day_dir, problems, boxinfo.get("boxTitle", ""),
+                                 {**cfg, "folder_box": use_box_in_name})
             if pairs:
                 go = True
                 if ui:
@@ -874,7 +1043,7 @@ def run_sync(cfg, args, dry_run=False, ui=None):
                 ui.warn(m) if ui else print(f"  {i}. [!] {m}")
                 continue
 
-            box_name = boxinfo.get("boxTitle", "") if cfg["folder_box"] else ""
+            box_name = boxinfo.get("boxTitle", "") if use_box_in_name else ""
             dest = problem_folder(day_dir, number, title, cfg["folder_title"], box_name)
             folder = dest.name
 
@@ -945,6 +1114,7 @@ def build_parser():
                     help="이미 있는 폴더 이름을 지금 설정에 맞게 바꿈")
     ap.add_argument("--no-rename-folders", action="store_true",
                     help="폴더 이름을 바꾸지 않음")
+    ap.add_argument("--layout", help="폴더 구조 템플릿. 예) \"{클럽}/{박스}\"")
     ap.add_argument("-y", "--yes", action="store_true", help="설치 여부를 묻지 않고 진행")
     ap.add_argument("--menu", action="store_true", help="메뉴 화면으로 시작")
     ap.add_argument("--no-menu", action="store_true", help="메뉴 없이 바로 실행")
@@ -966,7 +1136,7 @@ def wants_menu(args) -> bool:
             return False
     except Exception:
         return False
-    given = (args.url, args.date, args.team, args.repo)
+    given = (args.url, args.date, args.team, args.repo, getattr(args, "layout", None))
     flags = (args.force, args.dry_run, args.inspect, args.headless, args.show,
              args.folder_title, args.no_folder_title, args.folder_box,
              args.no_folder_box, args.no_readme,
@@ -1048,7 +1218,8 @@ def run_setup_if_needed(args) -> bool:
     """
     settings_path = HERE / SETTINGS_FILE
     cfg = load_config(args, strict=False)
-    if cfg["repo_path"] and cfg["team"]:
+    need_team = "team" in layout_placeholders(cfg["layout"])
+    if cfg["repo_path"] and (cfg["team"] or not need_team):
         return True
 
     try:

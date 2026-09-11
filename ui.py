@@ -198,6 +198,7 @@ def settings_panel(cfg, settings_file="settings.txt"):
     t.add_row("경로", str(cfg["repo_path"]))
     t.add_row("팀", str(cfg["team"]))
     t.add_row("날짜", date_txt)
+    t.add_row("폴더구조", str(cfg.get("layout") or "daily/{날짜}/{팀}"))
     t.add_row("폴더이름", shape)
     t.add_row("readme", "만듦" if cfg["readme"] else "[dim]안 만듦[/dim]")
     t.add_row("브라우저", "창 숨김" if cfg["headless"] else "창 띄움")
@@ -316,6 +317,7 @@ EDITABLE = [
     ("repo_path",    "경로 (algorithm 레포 위치)"),
     ("team",         "팀 (team-A ~ team-E)"),
     ("date",         "날짜 (비우면 오늘)"),
+    ("layout",       "폴더 구조 (예: {클럽}/{박스})"),
     ("folder_title", "폴더 이름에 문제 제목 넣기"),
     ("folder_box",   "폴더 이름에 문제 박스 이름 넣기"),
     ("readme",       "readme.md 만들기"),
@@ -323,6 +325,46 @@ EDITABLE = [
     ("headless",     "창 숨기고 실행하기"),
     ("list_url",     "문제 목록 주소 (창 숨김일 때 필요)"),
 ]
+
+
+LAYOUT_EXAMPLES = [
+    ("daily/{날짜}/{팀}",        "기본. 반 레포 규칙"),
+    ("{클럽}/{박스}",            "클럽 이름 / 문제 박스 이름"),
+    ("{팀}/{날짜}",              "조별로 모아두기"),
+    ("{년}/{월}/{일}/{팀}",      "연/월/일 로 나누기"),
+    ("daily/{날짜}/{팀}/{박스}", "기본 구조 안에 박스 폴더 하나 더"),
+]
+
+
+def ask_layout(current=""):
+    """폴더 구조 템플릿을 고르거나 직접 입력한다. 모르는 자리표시자면 다시 묻는다."""
+    console.print()
+    console.print(Text("  폴더 구조", style=f"bold {ACCENT}"))
+    console.print(Text("  문제 폴더들이 들어갈 위치입니다. 레포 기준 상대 경로이고,", style="dim"))
+    console.print(Text("  {날짜} {년} {월} {일} {팀} {클럽} {박스} 를 쓸 수 있습니다.", style="dim"))
+    console.print()
+
+    choices = [(f"{pad(t, 28)}  {desc}", t) for t, desc in LAYOUT_EXAMPLES]
+    choices.append(("직접 입력", "__custom__"))
+    picked = ask_select("어떤 구조로 할까요?", choices)
+    if picked is None:
+        return None
+    if picked != "__custom__":
+        return picked
+
+    # 직접 입력: swea_sync.check_layout 으로 형태를 확인한다 (순환 import 를 피해 여기서 가져온다)
+    import swea_sync
+    while True:
+        text = ask_text("폴더 구조", default=current)
+        if text is None:
+            return None
+        try:
+            return swea_sync.check_layout(text)
+        except ValueError as e:
+            error(str(e).splitlines()[0])
+            for line in str(e).splitlines()[1:]:
+                console.print(Text(f"  {line.strip()}", style="dim"))
+            console.print()
 
 
 def edit_settings(cfg, raw_values, save):
@@ -335,6 +377,7 @@ def edit_settings(cfg, raw_values, save):
         "repo_path": cfg["repo_path"],
         "team": cfg["team"],
         "date": raw_values.get("date", "") or "(오늘)",
+        "layout": raw_values.get("layout", "") or "daily/{날짜}/{팀}",
         "folder_title": "예" if cfg["folder_title"] else "아니오",
         "folder_box": "예" if cfg["folder_box"] else "아니오",
         "readme": "예" if cfg["readme"] else "아니오",
@@ -358,6 +401,8 @@ def edit_settings(cfg, raw_values, save):
     elif key == "date":
         value = ask_text("날짜 (YYYY-MM-DD, 비우면 오늘)",
                          default=raw_values.get("date", ""))
+    elif key == "layout":
+        value = ask_layout(raw_values.get("layout", ""))
     else:
         value = ask_text(labels[key], default=str(raw_values.get(key, "") or ""))
 
