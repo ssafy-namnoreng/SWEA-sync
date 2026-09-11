@@ -228,10 +228,10 @@ def load_config(args, strict=True) -> dict:
         "cdp_port": 9222,
     }
 
-    settings_path = HERE / SETTINGS_FILE
-    file_values, unknown = read_settings_file(settings_path)
+    spath = settings_path()
+    file_values, unknown = read_settings_file(spath)
     for w in unknown:
-        print(f"[!] {SETTINGS_FILE} {w}")
+        print(f"[!] {settings_label()} {w}")
     cfg.update({k: v for k, v in file_values.items() if v != ""})
 
     # 명령줄 옵션이 있으면 그게 이긴다
@@ -296,9 +296,9 @@ def load_config(args, strict=True) -> dict:
     except ValueError:
         sys.exit(f"포트는 숫자여야 합니다: {cfg['cdp_port']!r}")
 
-    if not settings_path.exists():
-        sys.exit(f"{settings_path} 가 없습니다.\n"
-                 f"  배포받은 {SETTINGS_FILE} 을 이 폴더에 두고 '경로' 와 '팀' 을 채워주세요.")
+    if not spath.exists():
+        sys.exit(f"{spath} 가 없습니다.\n"
+                 f"  배포받은 {SETTINGS_FILE} 을 이 폴더에 두고 다시 실행해주세요.")
     # strict=False 면 비어 있어도 그냥 돌려준다. 부르는 쪽에서 설정 마법사를 띄운다.
     if strict and not cfg["repo_path"]:
         sys.exit(f"{SETTINGS_FILE} 의 '경로' 가 비어 있습니다.\n"
@@ -754,6 +754,130 @@ def safe_folder_title(title):
 BOX_MAX = 30            # 박스 이름도 길어질 수 있으니 잘라둔다
 
 
+# ---------------------------------------------------------------- 프로필
+# 프로필 하나 = 레포 경로 + 그 경로에서 쓰는 설정 전부.
+# profiles/<이름>.txt 로 저장하고, profiles/_current.txt 에 지금 쓰는 이름을 적어둔다.
+# 파일 형식은 settings.txt 와 똑같아서 read/set_setting_value 를 그대로 쓴다.
+
+PROFILES_DIR = "profiles"
+CURRENT_MARK = "_current.txt"
+DEFAULT_PROFILE = "기본"
+
+# 프로필을 새로 만들 때 원본에서 비워야 하는 것들 (경로마다 다른 값)
+PER_PROFILE_KEYS = ("repo_path", "team", "date", "list_url")
+
+
+def profiles_dir() -> Path:
+    return HERE / PROFILES_DIR
+
+
+def valid_profile_name(name):
+    """프로필 이름은 파일 이름이 된다. 못 쓰는 글자를 정리하고 비면 None."""
+    name = safe_folder_title((name or "").strip())[:40].strip(" .-")
+    return name or None
+
+
+def profile_path(name) -> Path:
+    return profiles_dir() / f"{name}.txt"
+
+
+def list_profiles():
+    d = profiles_dir()
+    if not d.is_dir():
+        return []
+    return sorted(p.stem for p in d.glob("*.txt") if not p.name.startswith("_"))
+
+
+def current_profile() -> str:
+    mark = profiles_dir() / CURRENT_MARK
+    if mark.exists():
+        name = _read_text_any(mark).strip()
+        if name and profile_path(name).exists():
+            return name
+    names = list_profiles()
+    return names[0] if names else ""
+
+
+def set_current_profile(name):
+    profiles_dir().mkdir(parents=True, exist_ok=True)
+    (profiles_dir() / CURRENT_MARK).write_text(name, encoding="utf-8")
+
+
+def settings_path() -> Path:
+    """지금 쓰는 설정 파일. 프로필이 하나도 없으면 옛 방식(settings.txt)으로 간다."""
+    name = _forced_profile or current_profile()
+    if name:
+        return profile_path(name)
+    return HERE / SETTINGS_FILE
+
+
+_forced_profile = ""        # --profile 로 이번 실행만 다른 프로필을 쓸 때
+
+
+def settings_label() -> str:
+    name = _forced_profile or current_profile()
+    return f"프로필 '{name}'" if name else SETTINGS_FILE
+
+
+def create_profile(name, source: Path | None = None, inherit=True) -> Path:
+    """새 프로필 파일을 만든다.
+
+    source 가 있으면 그걸 복사한다 (보통 지금 프로필 - 취향 설정을 물려받는다).
+    없으면 배포된 settings.txt 템플릿을 쓴다. 경로마다 달라야 하는 값은 비운다.
+    """
+    dest = profile_path(name)
+    if dest.exists():
+        raise FileExistsError(f"이미 있는 프로필입니다: {name}")
+    profiles_dir().mkdir(parents=True, exist_ok=True)
+
+    template = source if (source and source.exists() and inherit) else (HERE / SETTINGS_FILE)
+    if template.exists():
+        dest.write_bytes(template.read_bytes())
+    else:
+        dest.write_text("", encoding="utf-8")
+    for key in PER_PROFILE_KEYS:
+        set_setting_value(dest, key, "")
+    return dest
+
+
+def delete_profile(name):
+    p = profile_path(name)
+    if p.exists():
+        p.unlink()
+    if current_profile() == name:
+        names = list_profiles()
+        if names:
+            set_current_profile(names[0])
+        else:
+            mark = profiles_dir() / CURRENT_MARK
+            if mark.exists():
+                mark.unlink()
+
+
+def migrate_legacy_settings():
+    """예전 방식(settings.txt 하나)에서 넘어온 사람을 위해 '기본' 프로필로 옮겨준다.
+
+    settings.txt 에 경로가 채워져 있고 profiles/ 가 아직 없을 때만.
+    원본 settings.txt 는 새 프로필의 템플릿으로 계속 쓰이므로 지우지 않는다.
+    """
+    legacy = HERE / SETTINGS_FILE
+    if profiles_dir().is_dir() and list_profiles():
+        return None
+    if not legacy.exists():
+        return None
+    values, _ = read_settings_file(legacy)
+    if not values.get("repo_path"):
+        return None
+    profiles_dir().mkdir(parents=True, exist_ok=True)
+    dest = profile_path(DEFAULT_PROFILE)
+    dest.write_bytes(legacy.read_bytes())
+    set_current_profile(DEFAULT_PROFILE)
+    # 템플릿에 개인 경로가 남아 있으면 새 프로필을 만들 때 딸려온다
+    for key in PER_PROFILE_KEYS:
+        set_setting_value(legacy, key, "")
+    return DEFAULT_PROFILE
+
+
 # ---------------------------------------------------------------- 폴더 구조
 
 DEFAULT_LAYOUT = "daily/{날짜}/{팀}"
@@ -941,7 +1065,7 @@ def write_readme(dest_dir, title, difficulty, url, force, ui=None):
 def run_sync(cfg, args, dry_run=False, ui=None):
     """실제 동기화 작업. ui 가 주어지면 꾸민 화면으로, 없으면 평범한 print 로 출력한다."""
     if ui is None:
-        print(f"[i] 설정      : {SETTINGS_FILE}  (경로={cfg['repo_path']} / 팀={cfg['team']} / 날짜={cfg['date']})")
+        print(f"[i] 설정      : {settings_label()}  (경로={cfg['repo_path']} / 팀={cfg['team']} / 날짜={cfg['date']})")
         shape = "SWEA-<번호>"
         if cfg["folder_box"]:
             shape += "(<박스>)"
@@ -1115,6 +1239,7 @@ def build_parser():
     ap.add_argument("--no-rename-folders", action="store_true",
                     help="폴더 이름을 바꾸지 않음")
     ap.add_argument("--layout", help="폴더 구조 템플릿. 예) \"{클럽}/{박스}\"")
+    ap.add_argument("--profile", help="이번 실행에 쓸 프로필 이름 (profiles/ 안의 것)")
     ap.add_argument("-y", "--yes", action="store_true", help="설치 여부를 묻지 않고 진행")
     ap.add_argument("--menu", action="store_true", help="메뉴 화면으로 시작")
     ap.add_argument("--no-menu", action="store_true", help="메뉴 없이 바로 실행")
@@ -1136,7 +1261,8 @@ def wants_menu(args) -> bool:
             return False
     except Exception:
         return False
-    given = (args.url, args.date, args.team, args.repo, getattr(args, "layout", None))
+    given = (args.url, args.date, args.team, args.repo, getattr(args, "layout", None),
+             getattr(args, "profile", None))
     flags = (args.force, args.dry_run, args.inspect, args.headless, args.show,
              args.folder_title, args.no_folder_title, args.folder_box,
              args.no_folder_box, args.no_readme,
@@ -1148,32 +1274,65 @@ def menu_loop(args):
     """메뉴 화면. 설정을 보고, 고치고, 실행한다."""
     import ui
 
-    settings_path = HERE / SETTINGS_FILE
-    save = lambda k, v: set_setting_value(settings_path, k, v)
+    save = lambda k, v: set_setting_value(settings_path(), k, v)
 
     def read_cfg():
         cfg = load_config(args, strict=False)
         cfg["auto_yes"] = args.yes
-        return cfg, read_settings_file(settings_path)[0]
+        return cfg, read_settings_file(settings_path())[0]
 
     def draw(cfg):
         """화면을 새로 그린다. 쌓지 않고 지우고 다시 그려야 화면 전환처럼 보인다."""
         ui.clear()
         ui.banner()
-        ui.settings_panel(cfg, SETTINGS_FILE)
+        ui.settings_panel(cfg, settings_label())
         ui.show_flash()
 
     while True:
         cfg, raw_values = read_cfg()
         draw(cfg)
         try:
-            action = ui.main_menu()
+            action = ui.main_menu(current_profile())
         except KeyboardInterrupt:
             action = "quit"
 
         if action == "quit":
             ui.notice("끝냅니다.")
             return 0
+
+        if action == "profile":
+            while True:
+                cfg, _ = read_cfg()
+                draw(cfg)
+                try:
+                    kind, name = ui.profile_menu(list_profiles(), current_profile())
+                except KeyboardInterrupt:
+                    break
+                if kind == "back":
+                    break
+                if kind == "switch":
+                    set_current_profile(name)
+                    ui.flash(f"프로필 '{name}' 으로 전환했습니다.")
+                    break
+                if kind == "new":
+                    try:
+                        made = new_profile_flow(args, ui)
+                    except Exception as e:
+                        ui.error(f"프로필을 만들지 못했습니다 - {type(e).__name__}: {e}")
+                        ui.pause()
+                        continue
+                    if made:
+                        ui.flash(f"프로필 '{made}' 을 만들고 전환했습니다.")
+                    break
+                if kind == "delete":
+                    delete_profile(name)
+                    ui.flash(f"프로필 '{name}' 을 지웠습니다.")
+                    if not list_profiles():
+                        ui.notice("프로필이 하나도 없습니다. 새로 만들어야 합니다.")
+                        if not run_setup_if_needed(args):
+                            return 1
+                    break
+            continue
 
         if action == "edit":
             # 한 항목 고칠 때마다 메인으로 튕기지 않도록 설정 화면에 머문다
@@ -1211,12 +1370,11 @@ def menu_loop(args):
 
 
 def run_setup_if_needed(args) -> bool:
-    """경로/팀이 아직 비어 있으면 물어봐서 settings.txt 에 채운다.
+    """프로필이 없거나 경로가 비어 있으면 물어봐서 채운다.
 
-    settings.txt 를 미리 손으로 고치지 않아도 첫 실행이 되도록 하는 게 목적이다.
+    설정 파일을 미리 손으로 고치지 않아도 첫 실행이 되도록 하는 게 목적이다.
     사람이 없는 실행(배치 등)에서는 물어볼 수 없으니 건너뛴다.
     """
-    settings_path = HERE / SETTINGS_FILE
     cfg = load_config(args, strict=False)
     need_team = "team" in layout_placeholders(cfg["layout"])
     if cfg["repo_path"] and (cfg["team"] or not need_team):
@@ -1230,13 +1388,36 @@ def run_setup_if_needed(args) -> bool:
         return True                     # 물어볼 수 없으면 기존 안내로 넘긴다
 
     import ui
-    got = ui.setup_wizard(check_repo_path, cfg["repo_path"], cfg["team"])
+    first = not list_profiles()         # 프로필이 하나도 없으면 이름부터 정한다
+    got = ui.setup_wizard(check_repo_path, cfg["repo_path"], cfg["team"], cfg["layout"],
+                          ask_name=first, existing_names=list_profiles())
     if not got:
         ui.notice("설정하지 않았습니다.")
         return False
+
+    if first:
+        name = got.pop("name", DEFAULT_PROFILE)
+        create_profile(name, source=HERE / SETTINGS_FILE)
+        set_current_profile(name)
+    got.pop("name", None)
     for key, value in got.items():
-        set_setting_value(settings_path, key, value)
+        set_setting_value(settings_path(), key, value)
     return True
+
+
+def new_profile_flow(args, ui):
+    """메뉴에서 '새 프로필 만들기'. 지금 프로필의 취향을 물려받고 경로/구조/팀만 새로 묻는다."""
+    cur = load_config(args, strict=False)
+    got = ui.setup_wizard(check_repo_path, "", cur["team"], cur["layout"],
+                          ask_name=True, existing_names=list_profiles())
+    if not got:
+        return None
+    name = got.pop("name")
+    create_profile(name, source=settings_path())
+    for key, value in got.items():
+        set_setting_value(profile_path(name), key, value)
+    set_current_profile(name)
+    return name
 
 
 def main():
@@ -1247,7 +1428,20 @@ def main():
         return 1
     load_playwright()
 
-    # 경로/팀이 비어 있으면 여기서 물어본다 (settings.txt 를 미리 안 고쳐도 되게)
+    # 예전 방식(settings.txt 하나)에서 넘어온 사람은 '기본' 프로필로 옮겨준다
+    moved = migrate_legacy_settings()
+    if moved:
+        print(f"[i] 기존 settings.txt 를 프로필 '{moved}' 으로 옮겼습니다. (profiles/{moved}.txt)")
+
+    # --profile: 이번 실행만 그 프로필로
+    global _forced_profile
+    if getattr(args, "profile", None):
+        want = valid_profile_name(args.profile)
+        if not want or not profile_path(want).exists():
+            sys.exit(f"프로필 '{args.profile}' 이 없습니다. 있는 것: {', '.join(list_profiles()) or '(없음)'}")
+        _forced_profile = want
+
+    # 경로가 비어 있으면 여기서 물어본다 (설정 파일을 미리 안 고쳐도 되게)
     if not run_setup_if_needed(args):
         return 1
 

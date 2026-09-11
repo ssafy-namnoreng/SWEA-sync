@@ -111,29 +111,52 @@ def _input(prompt):
         return None
 
 
+SEP = object()      # 목록 사이의 구분선.  ("── 위치 ──", SEP) 처럼 쓴다
+
+
 def ask_select(message, choices, default=None):
-    """choices: [(보여줄 글, 값), ...]  반환: 값 또는 취소 시 None"""
+    """choices: [(보여줄 글, 값[, 설명]), ...]  반환: 값 또는 취소 시 None
+
+    설명이 있으면 방향키로 그 항목에 갔을 때 아래에 한 줄로 띄운다.
+    값이 SEP 이면 고를 수 없는 구분선으로 그린다.
+    """
     if not _plain:
         try:
+            qc = []
+            for c in choices:
+                lab, val = c[0], c[1]
+                if val is SEP:
+                    qc.append(questionary.Separator(lab))
+                else:
+                    qc.append(questionary.Choice(lab, value=val,
+                                                 description=c[2] if len(c) > 2 else None))
             return questionary.select(
-                message,
-                choices=[questionary.Choice(lab, value=val) for lab, val in choices],
-                default=default, style=ASK, qmark=">",
+                message, choices=qc, default=default,
+                style=ASK, qmark=">", show_description=True,
             ).ask()
         except Exception as e:
             _fallback(e)
 
+    # 번호 입력 방식: 구분선은 제목처럼, 설명은 항목 아래 흐리게
     console.print(Text(f"> {message}", style="bold"))
-    for i, (lab, _v) in enumerate(choices, 1):
-        console.print(Text(f"   {i}) {lab}", style="dim"))
+    pickable = []
+    for c in choices:
+        lab, val = c[0], c[1]
+        if val is SEP:
+            console.print(Text(f"   {lab}", style=f"bold {ACCENT}"))
+            continue
+        pickable.append(c)
+        console.print(Text(f"   {len(pickable)}) {lab}", style="dim"))
+        if len(c) > 2 and c[2]:
+            console.print(Text(f"        {c[2]}", style="dim italic"))
     while True:
         raw = _input("   번호: ")
         if raw is None:
             return None
         raw = raw.strip()
-        if raw.isdigit() and 1 <= int(raw) <= len(choices):
-            return choices[int(raw) - 1][1]
-        console.print(Text(f"   1 ~ {len(choices)} 사이 번호를 입력해주세요.", style="yellow"))
+        if raw.isdigit() and 1 <= int(raw) <= len(pickable):
+            return pickable[int(raw) - 1][1]
+        console.print(Text(f"   1 ~ {len(pickable)} 사이 번호를 입력해주세요.", style="yellow"))
 
 
 def ask_text(message, default=""):
@@ -181,7 +204,7 @@ def banner():
 
 
 def settings_panel(cfg, settings_file="settings.txt"):
-    """지금 설정을 한눈에 보여준다."""
+    """지금 설정을 한눈에 보여준다. settings_file 자리에 프로필 이름이 온다."""
     t = Table.grid(padding=(0, 2))
     t.add_column(style="dim", justify="right", min_width=9)
     t.add_column()
@@ -208,13 +231,15 @@ def settings_panel(cfg, settings_file="settings.txt"):
                         border_style="grey42", padding=(1, 2), expand=False))
 
 
-def main_menu():
-    """무엇을 할지 고른다. 반환: run | dry | edit | quit"""
+def main_menu(profile_name=""):
+    """무엇을 할지 고른다. 반환: run | dry | edit | profile | quit"""
     choice = ask_select("무엇을 할까요?", [
-        ("실행하기 - 폴더와 파일을 만듭니다", "run"),
-        ("미리보기 - 파일은 안 만들고 확인만", "dry"),
-        ("설정 바꾸기", "edit"),
-        ("끝내기", "quit"),
+        ("실행하기",      "run",     "문제 목록을 읽어 폴더 · readme · sample input 을 만듭니다."),
+        ("미리보기",      "dry",     "파일은 만들지 않고 무엇이 만들어질지만 보여줍니다."),
+        ("설정 바꾸기",   "edit",    "지금 프로필의 설정을 고칩니다."),
+        (f"프로필  ({profile_name})" if profile_name else "프로필",
+                          "profile", "레포마다 다른 설정을 프로필로 나눠 씁니다. 전환 · 새로 만들기 · 삭제."),
+        ("끝내기",        "quit",    ""),
     ])
     return choice or "quit"
 
@@ -222,6 +247,28 @@ def main_menu():
 # ---------------------------------------------------------------- 첫 설정
 
 TEAMS = ["team-A", "team-B", "team-C", "team-D", "team-E"]
+
+
+def ask_profile_name(existing=(), default="기본"):
+    """새 프로필 이름. 이미 있는 이름이면 다시 묻는다."""
+    console.print()
+    console.print(Text("  프로필 이름", style=f"bold {ACCENT}"))
+    console.print(Text("  레포 하나에 설정 한 벌입니다. 나중에 다른 레포용 프로필을 더 만들 수 있습니다.",
+                       style="dim"))
+    console.print()
+    import swea_sync
+    while True:
+        text = ask_text("이름", default=default)
+        if text is None:
+            return None
+        name = swea_sync.valid_profile_name(text)
+        if not name:
+            error("이름을 비울 수 없습니다.")
+            continue
+        if name in existing:
+            error(f"'{name}' 은 이미 있습니다. 다른 이름을 적어주세요.")
+            continue
+        return name
 
 
 def ask_repo_path(check, current=""):
@@ -264,7 +311,7 @@ def ask_team(current=""):
     """조 이름을 고른다. 목록에 없으면 직접 입력."""
     console.print()
     console.print(Text("  우리 조", style=f"bold {ACCENT}"))
-    console.print(Text("  daily/<날짜>/<조> 아래에 파일을 만듭니다.", style="dim"))
+    console.print(Text("  폴더 구조의 {팀} 자리에 들어갑니다.", style="dim"))
     console.print()
 
     choices = [(t, t) for t in TEAMS] + [("직접 입력", "__other__")]
@@ -283,48 +330,6 @@ def ask_team(current=""):
         if text:
             return text
         error("비워둘 수 없습니다.")
-
-
-def setup_wizard(check_path, current_path="", current_team=""):
-    """처음 실행할 때 경로와 조를 물어본다. 반환: dict 또는 취소 시 None"""
-    console.print()
-    console.print(Text("  처음이시군요. 두 가지만 정하면 됩니다.", style=f"bold {ACCENT}"))
-    console.print(Text("  나중에 메뉴의 '설정 바꾸기' 에서 언제든 고칠 수 있습니다.", style="dim"))
-
-    path = ask_repo_path(check_path, current_path)
-    if path is None:
-        return None
-    team = ask_team(current_team)
-    if team is None:
-        return None
-
-    console.print()
-    console.print(Text("  저장했습니다.", style=f"bold {ACCENT}"))
-    console.print(Text(f"    경로  {path}", style="dim"))
-    console.print(Text(f"    팀    {team}", style="dim"))
-    console.print()
-    return {"repo_path": path, "team": team}
-
-
-# ---------------------------------------------------------------- 설정 편집
-
-def _yesno(label, current):
-    return ask_select(label, [("예", "예"), ("아니오", "아니오")],
-                      default="예" if current else "아니오")
-
-
-EDITABLE = [
-    ("repo_path",    "경로 (algorithm 레포 위치)"),
-    ("team",         "팀 (team-A ~ team-E)"),
-    ("date",         "날짜 (비우면 오늘)"),
-    ("layout",       "폴더 구조 (예: {클럽}/{박스})"),
-    ("folder_title", "폴더 이름에 문제 제목 넣기"),
-    ("folder_box",   "폴더 이름에 문제 박스 이름 넣기"),
-    ("readme",       "readme.md 만들기"),
-    ("rename_folders", "기존 폴더 이름도 갱신하기"),
-    ("headless",     "창 숨기고 실행하기"),
-    ("list_url",     "문제 목록 주소 (창 숨김일 때 필요)"),
-]
 
 
 LAYOUT_EXAMPLES = [
@@ -346,13 +351,13 @@ def ask_layout(current=""):
 
     choices = [(f"{pad(t, 28)}  {desc}", t) for t, desc in LAYOUT_EXAMPLES]
     choices.append(("직접 입력", "__custom__"))
-    picked = ask_select("어떤 구조로 할까요?", choices)
+    default = current if current in [t for t, _ in LAYOUT_EXAMPLES] else None
+    picked = ask_select("어떤 구조로 할까요?", choices, default=default)
     if picked is None:
         return None
     if picked != "__custom__":
         return picked
 
-    # 직접 입력: swea_sync.check_layout 으로 형태를 확인한다 (순환 import 를 피해 여기서 가져온다)
     import swea_sync
     while True:
         text = ask_text("폴더 구조", default=current)
@@ -367,42 +372,167 @@ def ask_layout(current=""):
             console.print()
 
 
+def setup_wizard(check_path, current_path="", current_team="", current_layout="",
+                 ask_name=False, existing_names=()):
+    """처음 실행할 때(또는 새 프로필을 만들 때) 필요한 것을 차례로 묻는다.
+
+    순서: 프로필 이름(옵션) -> 레포 경로 -> 폴더 구조 -> 팀(구조에 {팀} 이 있을 때만)
+    반환: dict 또는 취소 시 None
+    """
+    import swea_sync
+
+    console.print()
+    console.print(Text("  몇 가지만 정하면 됩니다.", style=f"bold {ACCENT}"))
+    console.print(Text("  나중에 메뉴의 '설정 바꾸기' 에서 언제든 고칠 수 있습니다.", style="dim"))
+
+    got = {}
+    if ask_name:
+        name = ask_profile_name(existing_names)
+        if name is None:
+            return None
+        got["name"] = name
+
+    path = ask_repo_path(check_path, current_path)
+    if path is None:
+        return None
+    got["repo_path"] = path
+
+    layout = ask_layout(current_layout or "daily/{날짜}/{팀}")
+    if layout is None:
+        return None
+    got["layout"] = layout
+
+    if "team" in swea_sync.layout_placeholders(layout):
+        team = ask_team(current_team)
+        if team is None:
+            return None
+        got["team"] = team
+    else:
+        got["team"] = ""
+
+    console.print()
+    console.print(Text("  저장했습니다.", style=f"bold {ACCENT}"))
+    for k, label in (("name", "프로필"), ("repo_path", "경로"), ("layout", "구조"), ("team", "팀")):
+        if got.get(k):
+            console.print(Text(f"    {pad(label, 6)} {got[k]}", style="dim"))
+    console.print()
+    return got
+
+
+# ---------------------------------------------------------------- 프로필
+
+def profile_menu(names, current):
+    """프로필 화면. 반환: ("switch", 이름) | ("new", None) | ("delete", 이름) | ("back", None)"""
+    console.print()
+    choices = []
+    if names:
+        choices.append(("── 프로필 ──", SEP))
+        for n in names:
+            mark = "*" if n == current else " "
+            choices.append((f"{mark} {n}", ("switch", n),
+                            "이 프로필로 전환합니다." if n != current else "지금 쓰는 프로필입니다."))
+    choices.append(("── 관리 ──", SEP))
+    choices.append(("새 프로필 만들기", ("new", None),
+                    "다른 레포나 다른 폴더 구조를 위한 설정 한 벌을 새로 만듭니다."))
+    if names:
+        choices.append(("프로필 삭제", ("delete", None), "설정 파일을 지웁니다. 만든 폴더는 그대로 둡니다."))
+    choices.append(("<- 돌아가기", ("back", None), ""))
+
+    picked = ask_select("프로필", choices)
+    if not picked or picked[0] == "back":
+        return ("back", None)
+    if picked[0] == "delete":
+        target = ask_select("어느 프로필을 지울까요?",
+                            [(n, n) for n in names] + [("<- 취소", "__cancel__")])
+        if not target or target == "__cancel__":
+            return ("back", None)
+        if ask_confirm(f"'{target}' 프로필을 지울까요? (만든 폴더는 남습니다)", default=False):
+            return ("delete", target)
+        return ("back", None)
+    return picked
+
+
+# ---------------------------------------------------------------- 설정 편집
+
+# 카테고리별로 나눈다. (키, 보여줄 이름, 설명) - 설명은 방향키로 그 항목에 갔을 때 아래에 뜬다
+SETTING_GROUPS = [
+    ("위치", [
+        ("repo_path", "경로",
+         "git clone 받은 algorithm 레포 폴더. 이 안에 문제 폴더를 만듭니다."),
+        ("layout", "폴더 구조",
+         "문제 폴더들이 들어갈 위치. {날짜} {팀} {클럽} {박스} 같은 자리표시자를 씁니다."),
+        ("team", "팀",
+         "폴더 구조의 {팀} 자리에 들어갈 이름. 구조에 {팀} 이 없으면 쓰이지 않습니다."),
+    ]),
+    ("폴더 이름", [
+        ("folder_title", "문제 제목 넣기",
+         "SWEA-1974 -> SWEA-1974-스도쿠 검증 처럼 폴더 이름에 문제 제목을 붙입니다."),
+        ("folder_box", "박스 이름 넣기",
+         "SWEA-1974 -> SWEA-1974(Stack2_1) 처럼 문제 박스 이름을 붙입니다. 구조에 {박스} 가 있으면 자동으로 뺍니다."),
+        ("rename_folders", "기존 폴더 이름 갱신",
+         "이미 만든 폴더 이름도 지금 규칙에 맞게 바꿉니다. 바꾸기 전에 목록을 보여주고 확인합니다."),
+    ]),
+    ("만드는 것", [
+        ("readme", "readme.md 만들기",
+         "문제마다 제목 · 난이도 · 바로가기 링크가 든 readme.md 를 만듭니다. 끄면 폴더와 input 만 받습니다."),
+    ]),
+    ("실행", [
+        ("date", "날짜",
+         "{날짜} 자리에 들어갈 날짜. 비우면 오늘. 지난 날짜를 채워 넣을 때만 적습니다."),
+        ("headless", "창 숨기고 실행",
+         "크롬 창 없이 조용히 돕니다. 로그인이 안 돼 있거나 문제 목록 주소가 없으면 창을 띄웁니다."),
+        ("list_url", "문제 목록 주소",
+         "그날 문제 박스 페이지 주소. 창 숨김일 때 필요합니다. 창을 띄워 쓰면 비워둬도 됩니다."),
+    ]),
+]
+EDITABLE = [(k, lb) for _, items in SETTING_GROUPS for k, lb, _ in items]
+YESNO_KEYS = ("folder_title", "folder_box", "readme", "headless", "rename_folders")
+
+
+def _yesno(label, current):
+    return ask_select(label, [("예", "예"), ("아니오", "아니오")],
+                      default="예" if current else "아니오")
+
+
 def edit_settings(cfg, raw_values, save):
     """설정을 하나 골라 바꾼다. save(canon_key, value) 로 파일에 기록한다.
 
-    반환: 바꿨으면 True (설정을 다시 읽어야 함)
+    반환: 설정 화면에 머물면 True, 메인으로 돌아가면 False
     """
-    labels = {k: lb for k, lb in EDITABLE}
     shown = {
-        "repo_path": cfg["repo_path"],
-        "team": cfg["team"],
-        "date": raw_values.get("date", "") or "(오늘)",
+        "repo_path": cfg["repo_path"] or "(비어 있음)",
         "layout": raw_values.get("layout", "") or "daily/{날짜}/{팀}",
-        "folder_title": "예" if cfg["folder_title"] else "아니오",
-        "folder_box": "예" if cfg["folder_box"] else "아니오",
-        "readme": "예" if cfg["readme"] else "아니오",
-        "rename_folders": "예" if cfg["rename_folders"] else "아니오",
-        "headless": "예" if cfg["headless"] else "아니오",
+        "team": cfg["team"] or "(비어 있음)",
+        "date": raw_values.get("date", "") or "(오늘)",
         "list_url": raw_values.get("list_url", "") or "(비어 있음)",
     }
-    # value=None 을 주면 questionary 가 '값 없음'으로 보고 제목 문자열을 돌려준다.
-    # 그래서 돌아가기는 반드시 따로 표시값을 준다.
-    BACK = "__back__"
-    w = max(disp_width(labels[k]) for k, _ in EDITABLE)
-    choices = [(f"{pad(labels[k], w)}    {str(shown[k])[:44]}", k) for k, _ in EDITABLE]
-    choices.append(("<- 돌아가기", BACK))
+    for k in YESNO_KEYS:
+        shown[k] = "예" if cfg[k] else "아니오"
 
+    w = max(disp_width(lb) for _, lb in EDITABLE)
+    BACK = "__back__"
+    choices = []
+    for group, items in SETTING_GROUPS:
+        choices.append((f"── {group} ──", SEP))
+        for key, label, desc in items:
+            choices.append((f"{pad(label, w)}    {str(shown[key])[:44]}", key, desc))
+    choices.append(("─" * 14, SEP))
+    choices.append(("<- 돌아가기", BACK, ""))
+
+    labels = dict(EDITABLE)
     key = ask_select("무엇을 바꿀까요?", choices)
     if not key or key == BACK or key not in labels:
         return False
 
-    if key in ("folder_title", "folder_box", "readme", "headless", "rename_folders"):
+    if key in YESNO_KEYS:
         value = _yesno(labels[key], cfg[key])
     elif key == "date":
         value = ask_text("날짜 (YYYY-MM-DD, 비우면 오늘)",
                          default=raw_values.get("date", ""))
     elif key == "layout":
         value = ask_layout(raw_values.get("layout", ""))
+    elif key == "team":
+        value = ask_team(cfg["team"])
     else:
         value = ask_text(labels[key], default=str(raw_values.get(key, "") or ""))
 

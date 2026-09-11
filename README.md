@@ -66,25 +66,54 @@ python swea_sync.py --help
 
 ## 2. 설정
 
-**처음 실행하면 물어봅니다.** `settings.txt` 를 미리 열 필요가 없습니다.
+**처음 실행하면 물어봅니다.** 설정 파일을 미리 열 필요가 없습니다.
 
 ```
-  처음이시군요. 두 가지만 정하면 됩니다.
+  몇 가지만 정하면 됩니다.
+
+  프로필 이름
+> 이름  기본
 
   algorithm 레포 경로
-  git clone 받은 algorithm 폴더를 알려주세요.
-  탐색기 주소창에서 복사해 붙여넣으면 됩니다. (따옴표는 있어도 됩니다)
-
 > 경로  C:/Users/내계정/PycharmProjects/algorithm
-
-  C:/Users/내계정/PycharmProjects/algorithm
   확인했습니다. daily 폴더가 있습니다.
-
 > 이 경로가 맞나요? (Y/n)
 
-  우리 조
+  폴더 구조
+> 어떤 구조로 할까요?
+   daily/{날짜}/{팀}             기본. 반 레포 규칙
+   {클럽}/{박스}                 클럽 이름 / 문제 박스 이름
+   {팀}/{날짜}                   조별로 모아두기
+   ...
+
+  우리 조                       ← 구조에 {팀} 이 있을 때만 묻습니다
 > 조  team-E
 ```
+
+### 프로필 — 레포마다 설정 한 벌
+
+설정은 **프로필** 단위로 저장됩니다. 프로필 하나 = 레포 경로 + 그 경로에서 쓰는 설정 전부.
+반 레포는 `daily/{날짜}/{팀}` 으로, 개인 정리용 레포는 `{클럽}/{박스}` 로, 이렇게
+**레포마다 다른 구조·설정을 나눠 둘 수 있습니다.**
+
+```
+profiles/
+├── _current.txt     ← 지금 쓰는 프로필 이름
+├── 기본.txt          ← 반 레포용
+└── 개인정리.txt      ← 내 레포용
+```
+
+메뉴의 **'프로필'** 에서 전환 · 새로 만들기 · 삭제를 합니다. 새 프로필은 지금 프로필의
+취향 설정(readme, 창숨김 등)을 물려받고 경로·구조·팀만 새로 묻습니다.
+
+```bash
+python swea_sync.py --profile 개인정리     # 이번 실행만 다른 프로필로
+```
+
+> 예전 버전(`settings.txt` 하나)을 쓰던 분은 처음 실행할 때 자동으로
+> `profiles/기본.txt` 로 옮겨집니다. 아무것도 안 하셔도 됩니다.
+>
+> `profiles/` 안에는 개인 경로가 들어 있으니 **git 에 올리지 마세요** (`.gitignore` 에 넣어뒀습니다).
 
 경로는 **실제로 있는 폴더인지 확인하고**, 아니면 이유를 알려주고 다시 묻습니다.
 
@@ -97,9 +126,10 @@ python swea_sync.py --help
 고른 경로를 다시 보여주고 **맞는지 확인**한 뒤 `settings.txt` 에 저장합니다.
 나중에는 메뉴의 **'설정 바꾸기'** 에서 언제든 고칠 수 있습니다.
 
-### 파일로 직접 고치기 (`settings.txt`)
+### 파일로 직접 고치기 (`profiles/<이름>.txt`)
 
 메모장으로 열어서 `키 = 값` 만 고쳐도 됩니다. `#` 으로 시작하는 줄은 주석입니다.
+(`settings.txt` 는 새 프로필을 만들 때 복사하는 템플릿이라 실제 설정은 아닙니다)
 
 ```ini
 경로       = C:/Users/내계정/PycharmProjects/algorithm
@@ -176,8 +206,23 @@ python swea_sync.py --repo "D:/다른경로/algorithm"
    끝내기
 ```
 
-**메모장으로 `settings.txt` 를 열 필요가 없습니다.** '설정 바꾸기' 에서 방향키로
-고르고 고치면 파일에 그대로 저장됩니다 (주석은 건드리지 않습니다).
+**설정 파일을 열 필요가 없습니다.** '설정 바꾸기' 에서 방향키로 고르고 고치면
+파일에 그대로 저장됩니다 (주석은 건드리지 않습니다).
+
+설정은 **위치 · 폴더 이름 · 만드는 것 · 실행** 네 묶음으로 나뉘어 있고, 방향키로
+항목에 가면 **그 설정이 무엇인지 아래에 한 줄 설명**이 뜹니다.
+
+```
+> 무엇을 바꿀까요?
+  ── 위치 ──
+ > 경로               C:/Users/내계정/PycharmProjects/algorithm
+   폴더 구조          {클럽}/{박스}
+   팀                 team-E
+  ── 폴더 이름 ──
+   문제 제목 넣기     예
+   ...
+  git clone 받은 algorithm 레포 폴더. 이 안에 문제 폴더를 만듭니다.   ← 설명
+```
 한 항목을 고쳐도 설정 화면에 그대로 머물러서 연달아 바꿀 수 있고,
 '돌아가기' 를 골라야 메인으로 나옵니다.
 
@@ -228,6 +273,7 @@ python swea_sync.py "https://swexpertacademy.com/main/talk/solvingClub/problemBo
 | `--no-readme` | 이번 실행만 `readme.md` 안 만들기 |
 | `--rename-folders` / `--no-rename-folders` | 이번 실행만 기존 폴더 이름 갱신 켜기/끄기 |
 | `--layout "{클럽}/{박스}"` | 이번 실행만 다른 폴더 구조로 |
+| `--profile 이름` | 이번 실행만 다른 프로필로 (`profiles/` 안의 것) |
 | `--menu` / `--no-menu` | 메뉴 화면을 띄우기 / 띄우지 않기 |
 | `-y`, `--yes` | 설치 여부를 묻지 않고 진행 |
 | `--headless` | 이번 실행만 창숨김으로 |
@@ -494,8 +540,9 @@ python swea_sync.py --inspect
 
 ## 7. 조원에게 배포할 때
 
-전달할 파일: `swea-sync.zip` 하나
-(안에 `START.bat`, `swea_sync.py`, `settings.txt`, `requirements.txt`, `README.md`, `사용설명서.pdf`)
+전달할 것: `swea-sync` 폴더 (`START.bat`, `swea_sync.py`, `ui.py`, `bootstrap.py`,
+`settings.txt`, `requirements.txt`, `README.md`, `사용설명서.pdf`).
+`profiles/` 폴더는 개인 설정이니 **빼고** 전달하세요.
 
 받는 사람이 할 일은 두 가지뿐입니다.
 
