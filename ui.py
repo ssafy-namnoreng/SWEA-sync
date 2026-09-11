@@ -22,16 +22,18 @@ from rich.text import Text
 console = Console(legacy_windows=False)
 
 # 파란 계열로 통일. 터미널 기본색과 싸우지 않게 굵기 위주로 강조한다.
-ASK = Style([
-    ("qmark",       "fg:#4a9eff bold"),
-    ("question",    "bold"),
-    ("pointer",     "fg:#4a9eff bold"),
-    ("highlighted", "fg:#4a9eff bold"),
-    ("selected",    "fg:#4a9eff"),
-    ("answer",      "fg:#4a9eff bold"),
-])
+ACCENT = "#4a9eff"      # 강조 (제목, 선택된 항목)
+CATEGORY = "#5fb3a1"    # 설정 화면의 카테고리 구분선. 강조되되 튀지 않는 청록
 
-ACCENT = "#4a9eff"
+ASK = Style([
+    ("qmark",       f"fg:{ACCENT} bold"),
+    ("question",    "bold"),
+    ("pointer",     f"fg:{ACCENT} bold"),
+    ("highlighted", f"fg:{ACCENT} bold"),
+    ("selected",    f"fg:{ACCENT}"),
+    ("answer",      f"fg:{ACCENT} bold"),
+    ("separator",   f"fg:{CATEGORY} bold"),
+])
 
 
 # ---------------------------------------------------------------- 글자 폭
@@ -143,7 +145,7 @@ def ask_select(message, choices, default=None):
     for c in choices:
         lab, val = c[0], c[1]
         if val is SEP:
-            console.print(Text(f"   {lab}", style=f"bold {ACCENT}"))
+            console.print(Text(f"   {lab}", style=f"bold {CATEGORY}"))
             continue
         pickable.append(c)
         console.print(Text(f"   {len(pickable)}) {lab}", style="dim"))
@@ -219,7 +221,7 @@ def settings_panel(cfg, settings_file="settings.txt"):
         shape += "-<제목>"
 
     t.add_row("경로", str(cfg["repo_path"]))
-    t.add_row("팀", str(cfg["team"]))
+    t.add_row("팀", str(cfg["team"]) if cfg["team"] else "[dim]없음[/dim]")
     t.add_row("날짜", date_txt)
     t.add_row("폴더구조", str(cfg.get("layout") or "daily/{날짜}/{팀}"))
     t.add_row("폴더이름", shape)
@@ -278,8 +280,8 @@ def ask_repo_path(check, current=""):
     반환: 확정된 경로, 취소하면 None
     """
     console.print()
-    console.print(Text("  algorithm 레포 경로", style=f"bold {ACCENT}"))
-    console.print(Text("  git clone 받은 algorithm 폴더를 알려주세요.", style="dim"))
+    console.print(Text("  저장 위치", style=f"bold {ACCENT}"))
+    console.print(Text("  문제 폴더들을 만들어 넣을 최상위 폴더를 알려주세요.", style="dim"))
     console.print(Text("  탐색기 주소창에서 복사해 붙여넣으면 됩니다. (따옴표는 있어도 됩니다)",
                        style="dim"))
     console.print()
@@ -413,7 +415,9 @@ def setup_wizard(check_path, current_path="", current_team="", current_layout=""
     console.print()
     console.print(Text("  저장했습니다.", style=f"bold {ACCENT}"))
     for k, label in (("name", "프로필"), ("repo_path", "경로"), ("layout", "구조"), ("team", "팀")):
-        if got.get(k):
+        if k == "team":
+            console.print(Text(f"    {pad(label, 6)} {got[k] or '없음'}", style="dim"))
+        elif got.get(k):
             console.print(Text(f"    {pad(label, 6)} {got[k]}", style="dim"))
     console.print()
     return got
@@ -458,7 +462,7 @@ def profile_menu(names, current):
 SETTING_GROUPS = [
     ("위치", [
         ("repo_path", "경로",
-         "git clone 받은 algorithm 레포 폴더. 이 안에 문제 폴더를 만듭니다."),
+         "문제 폴더들을 만들어 넣을 최상위 폴더입니다."),
         ("layout", "폴더 구조",
          "문제 폴더들이 들어갈 위치. {날짜} {팀} {클럽} {박스} 같은 자리표시자를 씁니다."),
         ("team", "팀",
@@ -502,7 +506,7 @@ def edit_settings(cfg, raw_values, save):
     shown = {
         "repo_path": cfg["repo_path"] or "(비어 있음)",
         "layout": raw_values.get("layout", "") or "daily/{날짜}/{팀}",
-        "team": cfg["team"] or "(비어 있음)",
+        "team": cfg["team"] or "(없음)",
         "date": raw_values.get("date", "") or "(오늘)",
         "list_url": raw_values.get("list_url", "") or "(비어 있음)",
     }

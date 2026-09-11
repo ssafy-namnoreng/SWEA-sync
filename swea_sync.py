@@ -200,15 +200,16 @@ def check_repo_path(text):
         return False, str(p), f"폴더가 아니라 파일입니다: {p}"
 
     p = p.resolve()
-    # algorithm 레포라면 daily 폴더가 있어야 한다. 없으면 상위/하위를 한 번 봐준다.
+    # 반 레포처럼 daily 폴더가 있으면 그걸 힌트로 상위/하위를 한 번 맞춰준다.
+    # 없어도 상관없다 - 폴더 구조는 사용자가 정하니까.
     if (p / "daily").is_dir():
-        return True, str(p), f"확인했습니다. daily 폴더가 있습니다."
+        return True, str(p), "확인했습니다. (daily 폴더 있음)"
     if p.name == "daily" and p.parent.is_dir():
         return True, str(p.parent), f"daily 안쪽을 고르신 것 같아 상위로 잡았습니다: {p.parent}"
     for child in sorted(x for x in p.iterdir() if x.is_dir()):
         if (child / "daily").is_dir():
-            return True, str(child), f"바로 아래 {child.name} 이 algorithm 레포로 보입니다."
-    return True, str(p), "폴더는 있지만 daily 폴더가 안 보입니다. 이 경로가 맞는지 확인해주세요."
+            return True, str(child), f"바로 아래 {child.name} 폴더에 daily 가 있어 그쪽으로 잡았습니다."
+    return True, str(p), "확인했습니다."
 
 
 def load_config(args, strict=True) -> dict:
@@ -302,7 +303,7 @@ def load_config(args, strict=True) -> dict:
     # strict=False 면 비어 있어도 그냥 돌려준다. 부르는 쪽에서 설정 마법사를 띄운다.
     if strict and not cfg["repo_path"]:
         sys.exit(f"{SETTINGS_FILE} 의 '경로' 가 비어 있습니다.\n"
-                 f"  git clone 받은 algorithm 폴더 경로를 적어주세요.\n"
+                 f"  문제 폴더들을 만들어 넣을 최상위 폴더 경로를 적어주세요.\n"
                  f"  예)  경로 = C:/Users/내계정/PycharmProjects/algorithm")
     if strict and not cfg["team"]:
         sys.exit(f"{SETTINGS_FILE} 의 '팀' 이 비어 있습니다.\n"
@@ -1223,7 +1224,7 @@ def build_parser():
     ap.add_argument("url", nargs="?", help="그날의 문제 목록(problem box) URL. 생략하면 열린 탭을 사용")
     ap.add_argument("--date", help=f"daily/<날짜> (기본: {SETTINGS_FILE} 의 '날짜', 비어 있으면 오늘)")
     ap.add_argument("--team", help=f"팀 폴더명 (기본: {SETTINGS_FILE} 의 '팀')")
-    ap.add_argument("--repo", help=f"algorithm 레포 경로 (기본: {SETTINGS_FILE} 의 '경로')")
+    ap.add_argument("--repo", help=f"문제 폴더를 만들 최상위 폴더 (기본: 프로필의 '경로')")
     ap.add_argument("--force", action="store_true", help="이미 있는 readme/input 도 덮어쓰기")
     ap.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않고 무엇을 만들지만 출력")
     ap.add_argument("--inspect", action="store_true", help="페이지 HTML/링크 덤프 (셀렉터 튜닝용)")
